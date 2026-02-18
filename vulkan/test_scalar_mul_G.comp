@@ -1,0 +1,31 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "secp256k1.glsl"
+
+// Input: 8 uint limbs representing the scalar in LE limb order
+layout(std430, set = 0, binding = 0) readonly buffer InputScalar { uint scalar_limbs[8]; };
+// Output: 33 uint values representing compressed pubkey bytes
+layout(std430, set = 0, binding = 1) writeonly buffer Output { uint pubkey[33]; };
+
+layout(local_size_x = 1) in;
+
+void main() {
+    // Load scalar
+    U256 k;
+    for (int i = 0; i < 8; i++) k.d[i] = scalar_limbs[i];
+
+    // Init G table
+    AffinePoint g_table[15];
+    secp_init_g_table(g_table);
+
+    // Compute k * G
+    JacobianPoint result;
+    secp_scalar_mul_G(result, k, g_table);
+
+    // Get compressed pubkey
+    uint out33[33];
+    secp_get_compressed_pubkey_uint(out33, result);
+    for (int i = 0; i < 33; i++) pubkey[i] = out33[i];
+}

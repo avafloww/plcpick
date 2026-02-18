@@ -11,7 +11,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use mining::{MiningBackend, MiningConfig};
-use output::{Styles, fmt_count, fmt_duration, human, print_match, register_did};
+use output::{Styles, fmt_count, fmt_duration, fmt_rate, human, print_match, register_did};
 use pattern::{difficulty, validate_pattern};
 
 /// Mine vanity did:plc identifiers
@@ -49,6 +49,10 @@ struct Cli {
     /// Mining backend to use
     #[arg(long, default_value = "cpu")]
     backend: String,
+
+    /// Show exact counts instead of abbreviated (e.g. 3,123,456/s instead of 3.1M/s)
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn main() {
@@ -86,41 +90,32 @@ fn main() {
 
     // header
     let diff = difficulty(&pattern);
+    let verbose = cli.verbose;
     println!();
     println!(
         "  {} {}",
-        s.dim.apply_to("plcpick"),
-        s.dim.apply_to(env!("CARGO_PKG_VERSION")),
+        s.cyan.apply_to("plcpick"),
+        s.dim.apply_to(format!("v{}", env!("CARGO_PKG_VERSION"))),
     );
+    println!();
     println!(
-        "  {} {}",
-        s.dim.apply_to("pattern   "),
+        "  {}  {}",
+        s.label.apply_to("pattern"),
         s.cyan.apply_to(&pattern),
     );
     println!(
-        "  {} {}",
-        s.dim.apply_to("difficulty"),
-        s.dim.apply_to(format!("~{} attempts", human(diff))),
+        "  {}  {} {}",
+        s.label.apply_to("  est. "),
+        s.magenta.apply_to(format!("~{}", human(diff))),
+        s.dim.apply_to("attempts"),
     );
+    println!();
     println!(
-        "  {} {}",
-        s.dim.apply_to("backend   "),
-        backend.name(),
-    );
-    println!(
-        "  {} {}",
-        s.dim.apply_to("threads   "),
-        threads,
-    );
-    println!(
-        "  {} {}",
-        s.dim.apply_to("handle    "),
-        handle,
-    );
-    println!(
-        "  {} {}",
-        s.dim.apply_to("pds       "),
-        pds,
+        "  {}  {}  ·  {} threads  ·  {}",
+        s.label.apply_to("config "),
+        s.value.apply_to(backend.name()),
+        s.value.apply_to(threads),
+        s.dim.apply_to(format!("{handle} @ {pds}")),
     );
     println!();
 
@@ -128,7 +123,7 @@ fn main() {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
-            .template("  {spinner:.cyan} {msg}")
+            .template("  {spinner:.cyan.bold} {msg}")
             .unwrap(),
     );
 
@@ -197,10 +192,16 @@ fn main() {
                 } else {
                     "...".to_string()
                 };
+                let count_str = if verbose { fmt_count(n) } else { human(n) };
+                let rate_str = if verbose {
+                    format!("{}/s", fmt_count(rate as u64))
+                } else {
+                    format!("{}/s", fmt_rate(rate))
+                };
                 pb.set_message(format!(
-                    "mining...  {}  |  {:.0}/s  |  {}  |  ETA {}",
-                    fmt_count(n),
-                    rate,
+                    "mining  {}  ·  {}  ·  {}  ·  ETA {}",
+                    count_str,
+                    rate_str,
                     fmt_duration(elapsed),
                     eta,
                 ));

@@ -4,20 +4,26 @@ use crate::plc::PlcOperation;
 
 pub struct Styles {
     pub dim: Style,
+    pub label: Style,
     pub green: Style,
     pub yellow: Style,
     pub cyan: Style,
     pub red: Style,
+    pub magenta: Style,
+    pub value: Style,
 }
 
 impl Styles {
     pub fn new() -> Self {
         Self {
             dim: Style::new().dim(),
-            green: Style::new().green().bold(),
-            yellow: Style::new().yellow(),
-            cyan: Style::new().cyan(),
-            red: Style::new().red(),
+            label: Style::new().color256(245),         // medium gray — readable but recessive
+            green: Style::new().color256(114).bold(),   // bright mint green
+            yellow: Style::new().color256(220).bold(),  // vivid amber
+            cyan: Style::new().color256(81),            // bright sky blue
+            red: Style::new().color256(203).bold(),     // bright coral red
+            magenta: Style::new().color256(176),        // soft pink/magenta
+            value: Style::new().white().bold(),         // bright white for values
         }
     }
 }
@@ -28,26 +34,34 @@ pub fn print_match(m: &crate::mining::Match, s: &Styles) {
     println!();
     println!(
         "  {} {}",
-        s.green.apply_to("found"),
+        s.green.apply_to("✓"),
         s.green.apply_to(&m.did),
     );
     println!(
-        "  {}",
+        "    {}",
         s.dim.apply_to(format!(
-            "{} attempts, {:.1}s, {:.0}/s",
+            "{} attempts  ·  {}  ·  {}/s",
             fmt_count(m.attempts),
-            m.elapsed.as_secs_f64(),
-            rate,
+            fmt_duration(m.elapsed.as_secs_f64()),
+            fmt_rate(rate),
         )),
     );
     println!();
-    println!("  {}", s.yellow.apply_to("private key (keep this safe!):"));
-    println!("  {}", m.key_hex);
+    println!(
+        "  {} {}",
+        s.yellow.apply_to("⚠"),
+        s.yellow.apply_to("private key (keep this safe!)"),
+    );
+    println!("    {}", s.value.apply_to(&m.key_hex));
     println!();
-    println!("  {}", s.dim.apply_to("genesis operation:"));
+    println!(
+        "  {} {}",
+        s.label.apply_to("▸"),
+        s.label.apply_to("genesis operation"),
+    );
     let json = serde_json::to_string_pretty(&m.op).unwrap();
     for line in json.lines() {
-        println!("  {}", line);
+        println!("    {}", s.dim.apply_to(line));
     }
 }
 
@@ -85,6 +99,16 @@ pub fn human(n: u64) -> String {
         n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
         n if n >= 1_000 => format!("{:.1}K", n as f64 / 1e3),
         n => format!("{n}"),
+    }
+}
+
+pub fn fmt_rate(rate: f64) -> String {
+    let n = rate as u64;
+    match n {
+        n if n >= 1_000_000_000 => format!("{:.1}B", rate / 1e9),
+        n if n >= 1_000_000 => format!("{:.1}M", rate / 1e6),
+        n if n >= 1_000 => format!("{:.1}K", rate / 1e3),
+        _ => format!("{:.0}", rate),
     }
 }
 

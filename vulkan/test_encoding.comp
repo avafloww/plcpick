@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 1) in;
+
+#include "encoding.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Base32Input {
+    uint8_t data[];
+} buf_b32_in;
+
+layout(std430, set = 0, binding = 1) buffer Base32Output {
+    uint8_t data[];
+} buf_b32_out;
+
+layout(std430, set = 0, binding = 2) readonly buffer Base58Input {
+    uint8_t data[];
+} buf_b58_in;
+
+layout(std430, set = 0, binding = 3) buffer Base58Output {
+    uint8_t data[];
+} buf_b58_out;
+
+layout(std430, set = 0, binding = 4) readonly buffer Base64Input {
+    uint8_t data[];
+} buf_b64_in;
+
+layout(std430, set = 0, binding = 5) buffer Base64Output {
+    uint8_t data[];
+} buf_b64_out;
+
+void main() {
+    // Base32: 15 bytes -> 24 chars
+    uint8_t b32_in[15];
+    for (int i = 0; i < 15; i++) b32_in[i] = buf_b32_in.data[i];
+    uint8_t b32_out[24];
+    enc_base32_encode_15bytes(b32_in, b32_out);
+    for (int i = 0; i < 24; i++) buf_b32_out.data[i] = b32_out[i];
+
+    // Base58: 35 bytes -> 48 chars
+    uint8_t b58_in[35];
+    for (int i = 0; i < 35; i++) b58_in[i] = buf_b58_in.data[i];
+    uint8_t b58_out[48];
+    enc_base58_encode_35bytes(b58_in, b58_out);
+    for (int i = 0; i < 48; i++) buf_b58_out.data[i] = b58_out[i];
+
+    // Base64url: 64 bytes -> 86 chars
+    uint8_t b64_in[64];
+    for (int i = 0; i < 64; i++) b64_in[i] = buf_b64_in.data[i];
+    uint8_t b64_out[86];
+    enc_base64url_encode_64bytes(b64_in, b64_out);
+    for (int i = 0; i < 86; i++) buf_b64_out.data[i] = b64_out[i];
+}

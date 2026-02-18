@@ -1,0 +1,36 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 1) in;
+
+#include "sha256.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer InputData {
+    uint8_t input_data[];
+} buf_input;
+
+layout(std430, set = 0, binding = 1) readonly buffer InputLen {
+    uint input_len;
+} buf_len;
+
+layout(std430, set = 0, binding = 2) buffer OutputHash {
+    uint8_t hash_out[];
+} buf_output;
+
+void main() {
+    uint len = buf_len.input_len;
+
+    // Copy input into local array (max 256 bytes)
+    uint8_t data[256];
+    for (uint i = 0u; i < 256u; i++) {
+        data[i] = (i < len) ? buf_input.input_data[i] : uint8_t(0u);
+    }
+
+    uint8_t hash_result[32];
+    sha256_hash(data, len, hash_result);
+
+    for (int i = 0; i < 32; i++) {
+        buf_output.hash_out[i] = hash_result[i];
+    }
+}

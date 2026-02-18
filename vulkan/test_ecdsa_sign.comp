@@ -1,0 +1,89 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 1) in;
+
+#include "secp256k1.glsl"
+#include "sha256.glsl"
+#include "hmac_drbg.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer PrivKey {
+    uint8_t privkey[];
+} buf_privkey;
+
+layout(std430, set = 0, binding = 1) readonly buffer MsgHash {
+    uint8_t msg_hash[];
+} buf_msg_hash;
+
+layout(std430, set = 0, binding = 2) buffer SigOut {
+    uint8_t sig[];
+} buf_sig;
+
+void main() {
+    // Load privkey and msg_hash into local arrays
+    uint8_t privkey32[32];
+    uint8_t hash32[32];
+    for (int i = 0; i < 32; i++) {
+        privkey32[i] = buf_privkey.privkey[i];
+        hash32[i] = buf_msg_hash.msg_hash[i];
+    }
+
+    // Init G table
+    AffinePoint g_table[15];
+    secp_init_g_table(g_table);
+
+    // Load private key scalar
+    U256 priv_scalar;
+    hmac_load_scalar_bytes(priv_scalar, privkey32);
+
+    // RFC 6979 nonce
+    U256 k;
+    hmac_rfc6979_nonce(k, privkey32, hash32);
+
+    // Compute R = k * G
+    JacobianPoint R_point;
+    secp_scalar_mul_G(R_point, k, g_table);
+
+    // Get r = R.x mod n
+    U256 rx, ry;
+    secp_jacobian_to_affine(rx, ry, R_point);
+
+    // r_val = rx mod n
+    U256 r_val = rx;
+    if (secp_cmp(r_val, SECP_N) >= 0) {
+        secp_sub256(r_val, r_val, SECP_N);
+    }
+
+    // s = k^(-1) * (hash + r * privkey) mod n
+    U256 k_inv;
+    secp_scalar_inv(k_inv, k);
+
+    U256 hash_scalar;
+    hmac_load_scalar_bytes(hash_scalar, hash32);
+
+    U256 r_priv;
+    secp_scalar_mul(r_priv, r_val, priv_scalar);
+
+    U256 sum;
+    secp_scalar_add(sum, hash_scalar, r_priv);
+
+    U256 s_val;
+    secp_scalar_mul(s_val, k_inv, sum);
+
+    // Low-s normalization
+    if (secp_cmp(s_val, SECP_N_HALF) > 0) {
+        secp_sub256(s_val, SECP_N, s_val);
+    }
+
+    // Store r and s as big-endian bytes (64 bytes total)
+    uint8_t r_bytes[32];
+    uint8_t s_bytes[32];
+    hmac_store_scalar_bytes(r_bytes, r_val);
+    hmac_store_scalar_bytes(s_bytes, s_val);
+
+    for (int i = 0; i < 32; i++) {
+        buf_sig.sig[i] = r_bytes[i];
+        buf_sig.sig[32 + i] = s_bytes[i];
+    }
+}

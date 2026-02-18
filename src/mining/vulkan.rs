@@ -43,6 +43,7 @@ mod tests {
     use vulkano::device::DeviceFeatures;
     use vulkano::VulkanLibrary;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use sha2::Digest;
 
     struct VulkanTestContext {
         device: Arc<Device>,
@@ -79,6 +80,8 @@ mod tests {
                 enabled_features: DeviceFeatures {
                     shader_int64: true,
                     shader_int8: true,
+                    uniform_and_storage_buffer8_bit_access: true,
+                    storage_buffer8_bit_access: true,
                     ..DeviceFeatures::empty()
                 },
                 queue_create_infos: vec![QueueCreateInfo {
@@ -144,6 +147,26 @@ mod tests {
         ctx: &VulkanTestContext,
         data: &[u32],
     ) -> vulkano::buffer::Subbuffer<[u32]> {
+        Buffer::from_iter(
+            ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            data.iter().copied(),
+        )
+        .unwrap()
+    }
+
+    fn create_storage_buffer_u8(
+        ctx: &VulkanTestContext,
+        data: &[u8],
+    ) -> vulkano::buffer::Subbuffer<[u8]> {
         Buffer::from_iter(
             ctx.memory_allocator.clone(),
             BufferCreateInfo {
@@ -566,5 +589,359 @@ mod tests {
             &gpu_bytes[..], cpu_bytes,
             "GPU scalar_mul_G must match k256"
         );
+    }
+
+    // --- SHA256 tests ---
+
+    #[test]
+    fn vulkan_sha256_matches_cpu() {
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_sha256.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        let test_cases: &[&[u8]] = &[
+            b"hello",
+            b"",
+            b"The quick brown fox jumps over the lazy dog",
+            // A 64-byte input (exactly one block boundary)
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            // A 65-byte input (just over one block)
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef!",
+        ];
+
+        for input in test_cases {
+            let expected = sha2::Sha256::digest(input);
+
+            // Pad input to at least 4 bytes for the SSBO (can't have empty buffer)
+            let mut padded_input = input.to_vec();
+            if padded_input.is_empty() {
+                padded_input.push(0);
+            }
+            while padded_input.len() % 4 != 0 {
+                padded_input.push(0);
+            }
+
+            let input_buf = create_storage_buffer_u8(&ctx, &padded_input);
+            let len_buf = create_storage_buffer(&ctx, &[input.len() as u32]);
+            let output_buf = create_storage_buffer_u8(&ctx, &[0u8; 32]);
+
+            let layout = pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                ctx.descriptor_set_allocator.clone(),
+                layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, input_buf),
+                    WriteDescriptorSet::buffer(1, len_buf),
+                    WriteDescriptorSet::buffer(2, output_buf.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+
+            dispatch_and_wait(&ctx, &pipeline, set);
+
+            let result = output_buf.read().unwrap();
+            assert_eq!(
+                &result[..], &expected[..],
+                "GPU SHA256 mismatch for input {:?}\nGPU:      {:02x?}\nExpected: {:02x?}",
+                String::from_utf8_lossy(input), &result[..], &expected[..]
+            );
+        }
+    }
+
+    // --- ECDSA signing test ---
+
+    #[test]
+    fn vulkan_ecdsa_sign_matches_k256() {
+        use k256::ecdsa::{SigningKey, VerifyingKey, Signature};
+
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_ecdsa_sign.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        // Use a fixed key for reproducibility
+        let privkey_bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        ];
+
+        // Hash a message
+        let msg_hash = sha2::Sha256::digest(b"test message for ECDSA");
+        let msg_hash_bytes: [u8; 32] = msg_hash.into();
+
+        let privkey_buf = create_storage_buffer_u8(&ctx, &privkey_bytes);
+        let msghash_buf = create_storage_buffer_u8(&ctx, &msg_hash_bytes);
+        let sig_buf = create_storage_buffer_u8(&ctx, &[0u8; 64]);
+
+        let layout = pipeline.layout().set_layouts().get(0).unwrap();
+        let set = DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, privkey_buf),
+                WriteDescriptorSet::buffer(1, msghash_buf),
+                WriteDescriptorSet::buffer(2, sig_buf.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+
+        dispatch_and_wait(&ctx, &pipeline, set);
+
+        let sig_result = sig_buf.read().unwrap();
+        let r_bytes: [u8; 32] = sig_result[..32].try_into().unwrap();
+        let s_bytes: [u8; 32] = sig_result[32..64].try_into().unwrap();
+
+        // Construct signature and verify with k256
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&r_bytes);
+        sig_bytes[32..].copy_from_slice(&s_bytes);
+        let signature = Signature::from_bytes(&sig_bytes.into()).expect("invalid signature format");
+
+        let signing_key = SigningKey::from_bytes(&privkey_bytes.into()).unwrap();
+        let verifying_key = VerifyingKey::from(&signing_key);
+
+        // Verify using prehashed message
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        verifying_key
+            .verify_prehash(&msg_hash_bytes, &signature)
+            .expect("GPU ECDSA signature verification failed");
+    }
+
+    // --- Encoding tests ---
+
+    #[test]
+    fn vulkan_base32_matches_cpu() {
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_encoding.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        // Test data: 15 bytes
+        let b32_input: [u8; 15] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+                                    0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B];
+        let expected_b32 = data_encoding::BASE32_NOPAD.encode(&b32_input).to_lowercase();
+
+        // Dummy data for other encodings (must provide all bindings)
+        let b58_input = [0u8; 35];
+        let b64_input = [0u8; 64];
+
+        let b32_in_buf = create_storage_buffer_u8(&ctx, &b32_input);
+        let b32_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 24]);
+        let b58_in_buf = create_storage_buffer_u8(&ctx, &b58_input);
+        let b58_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 48]);
+        let b64_in_buf = create_storage_buffer_u8(&ctx, &b64_input);
+        let b64_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 88]); // pad to 4-byte alignment
+
+        let layout = pipeline.layout().set_layouts().get(0).unwrap();
+        let set = DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, b32_in_buf),
+                WriteDescriptorSet::buffer(1, b32_out_buf.clone()),
+                WriteDescriptorSet::buffer(2, b58_in_buf),
+                WriteDescriptorSet::buffer(3, b58_out_buf),
+                WriteDescriptorSet::buffer(4, b64_in_buf),
+                WriteDescriptorSet::buffer(5, b64_out_buf),
+            ],
+            [],
+        )
+        .unwrap();
+
+        dispatch_and_wait(&ctx, &pipeline, set);
+
+        let result = b32_out_buf.read().unwrap();
+        let gpu_str = String::from_utf8(result[..24].to_vec()).unwrap();
+        assert_eq!(
+            gpu_str, expected_b32,
+            "GPU base32 mismatch\nGPU:      {}\nExpected: {}",
+            gpu_str, expected_b32
+        );
+    }
+
+    #[test]
+    fn vulkan_base58_matches_cpu() {
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_encoding.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        // Test data: 35 bytes starting with 0xe7 (multicodec prefix, same as real usage)
+        let mut b58_input = [0u8; 35];
+        b58_input[0] = 0xe7;
+        b58_input[1] = 0x01;
+        for i in 2..35 {
+            b58_input[i] = (i * 7 + 3) as u8;
+        }
+        let expected_b58 = bs58::encode(&b58_input).into_string();
+
+        // Dummy data for other encodings
+        let b32_input = [0u8; 15];
+        let b64_input = [0u8; 64];
+
+        let b32_in_buf = create_storage_buffer_u8(&ctx, &b32_input);
+        let b32_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 24]);
+        let b58_in_buf = create_storage_buffer_u8(&ctx, &b58_input);
+        let b58_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 48]);
+        let b64_in_buf = create_storage_buffer_u8(&ctx, &b64_input);
+        let b64_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 88]);
+
+        let layout = pipeline.layout().set_layouts().get(0).unwrap();
+        let set = DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, b32_in_buf),
+                WriteDescriptorSet::buffer(1, b32_out_buf),
+                WriteDescriptorSet::buffer(2, b58_in_buf),
+                WriteDescriptorSet::buffer(3, b58_out_buf.clone()),
+                WriteDescriptorSet::buffer(4, b64_in_buf),
+                WriteDescriptorSet::buffer(5, b64_out_buf),
+            ],
+            [],
+        )
+        .unwrap();
+
+        dispatch_and_wait(&ctx, &pipeline, set);
+
+        let result = b58_out_buf.read().unwrap();
+        let gpu_str = String::from_utf8(result[..expected_b58.len()].to_vec()).unwrap();
+        assert_eq!(
+            gpu_str, expected_b58,
+            "GPU base58 mismatch\nGPU:      {}\nExpected: {}",
+            gpu_str, expected_b58
+        );
+    }
+
+    #[test]
+    fn vulkan_base64url_matches_cpu() {
+        use base64::Engine;
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_encoding.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        // Test data: 64 bytes
+        let mut b64_input = [0u8; 64];
+        for i in 0..64 {
+            b64_input[i] = (i * 13 + 5) as u8;
+        }
+        let expected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&b64_input);
+
+        // Dummy data for other encodings
+        let b32_input = [0u8; 15];
+        let b58_input = [0u8; 35];
+
+        let b32_in_buf = create_storage_buffer_u8(&ctx, &b32_input);
+        let b32_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 24]);
+        let b58_in_buf = create_storage_buffer_u8(&ctx, &b58_input);
+        let b58_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 48]);
+        let b64_in_buf = create_storage_buffer_u8(&ctx, &b64_input);
+        let b64_out_buf = create_storage_buffer_u8(&ctx, &[0u8; 88]);
+
+        let layout = pipeline.layout().set_layouts().get(0).unwrap();
+        let set = DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, b32_in_buf),
+                WriteDescriptorSet::buffer(1, b32_out_buf),
+                WriteDescriptorSet::buffer(2, b58_in_buf),
+                WriteDescriptorSet::buffer(3, b58_out_buf),
+                WriteDescriptorSet::buffer(4, b64_in_buf),
+                WriteDescriptorSet::buffer(5, b64_out_buf.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+
+        dispatch_and_wait(&ctx, &pipeline, set);
+
+        let result = b64_out_buf.read().unwrap();
+        let gpu_str = String::from_utf8(result[..86].to_vec()).unwrap();
+        assert_eq!(
+            gpu_str, expected_b64,
+            "GPU base64url mismatch\nGPU:      {}\nExpected: {}",
+            gpu_str, expected_b64
+        );
+    }
+
+    // --- Pattern matching test ---
+
+    #[test]
+    fn vulkan_glob_match_works() {
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_pattern.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        let test_cases: &[(&str, &str, bool)] = &[
+            // (pattern, text, expected_match)
+            ("abcdefghijklmnopqrstuvwx", "abcdefghijklmnopqrstuvwx", true),  // exact match
+            ("abc*", "abcdefghijklmnopqrstuvwx", true),                       // prefix
+            ("*vwx", "abcdefghijklmnopqrstuvwx", true),                       // suffix
+            ("*ghij*", "abcdefghijklmnopqrstuvwx", true),                     // middle
+            ("*", "abcdefghijklmnopqrstuvwx", true),                          // match all
+            ("xyz*", "abcdefghijklmnopqrstuvwx", false),                      // no match prefix
+            ("*xyz", "abcdefghijklmnopqrstuvwx", false),                      // no match suffix
+            ("abc", "abcdefghijklmnopqrstuvwx", false),                       // too short
+            ("a*x", "abcdefghijklmnopqrstuvwx", true),                        // prefix+suffix
+            ("a*z", "abcdefghijklmnopqrstuvwx", false),                       // prefix+wrong suffix
+        ];
+
+        for (pattern, text, expected) in test_cases {
+            // Pad pattern to 24 bytes
+            let mut pat_bytes = [0u8; 24];
+            for (i, &b) in pattern.as_bytes().iter().enumerate() {
+                if i < 24 { pat_bytes[i] = b; }
+            }
+            let pat_len = pattern.len() as u32;
+
+            // Pad text to 24 bytes
+            let mut text_bytes = [0u8; 24];
+            for (i, &b) in text.as_bytes().iter().enumerate() {
+                if i < 24 { text_bytes[i] = b; }
+            }
+
+            let pat_buf = create_storage_buffer_u8(&ctx, &pat_bytes);
+            let pat_len_buf = create_storage_buffer(&ctx, &[pat_len]);
+            let text_buf = create_storage_buffer_u8(&ctx, &text_bytes);
+            let result_buf = create_storage_buffer(&ctx, &[0u32]);
+
+            let layout = pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                ctx.descriptor_set_allocator.clone(),
+                layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, pat_buf),
+                    WriteDescriptorSet::buffer(1, pat_len_buf),
+                    WriteDescriptorSet::buffer(2, text_buf),
+                    WriteDescriptorSet::buffer(3, result_buf.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+
+            dispatch_and_wait(&ctx, &pipeline, set);
+
+            let result = result_buf.read().unwrap();
+            let matched = result[0] == 1;
+            assert_eq!(
+                matched, *expected,
+                "Pattern '{}' vs text '{}': GPU={}, expected={}",
+                pattern, text, matched, expected
+            );
+        }
     }
 }

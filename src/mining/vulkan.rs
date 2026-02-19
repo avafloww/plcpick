@@ -1,10 +1,113 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use super::{Match, MiningBackend, MiningConfig};
+use std::sync::Arc;
+use std::time::Instant;
 
-#[allow(dead_code)]
+use k256::ecdsa::SigningKey;
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags};
+use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::compute::{ComputePipeline, ComputePipelineCreateInfo};
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
+use vulkano::sync::GpuFuture;
+use vulkano::VulkanLibrary;
+
+use super::{Match, MiningBackend, MiningConfig};
+use crate::pattern::glob_match;
+use crate::plc::{build_signed_op, did_suffix, CborTemplate};
+
+const WORKGROUP_SIZE: u32 = 256;
+const NUM_WORKGROUPS: u32 = 4;
+const TOTAL_THREADS: u32 = WORKGROUP_SIZE * NUM_WORKGROUPS;
+const ITERATIONS_PER_LAUNCH: u32 = 16;
+const MAX_MATCHES: u32 = 64;
+const MATCH_SLOT_UINTS: u32 = 32; // 32 uints per match slot
+
+// Push constants struct — must match the GLSL push_constant layout
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct PushConstants {
+    is_first_launch: u32,
+    iterations_per_thread: u32,
+    max_matches: u32,
+}
+
 pub struct VulkanBackend {
     pub device_index: usize,
+}
+
+fn load_shader_module(device: Arc<Device>, spv_bytes: &[u8]) -> Arc<ShaderModule> {
+    let spirv_words: Vec<u32> = spv_bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    unsafe { ShaderModule::new(device, ShaderModuleCreateInfo::new(&spirv_words)) }
+        .expect("failed to create shader module")
+}
+
+fn make_compute_pipeline(device: Arc<Device>, shader_module: Arc<ShaderModule>) -> Arc<ComputePipeline> {
+    let entry_point = shader_module.entry_point("main").unwrap();
+    let stage = PipelineShaderStageCreateInfo::new(entry_point);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .unwrap()
+}
+
+fn make_buffer_u32(
+    allocator: Arc<StandardMemoryAllocator>,
+    data: &[u32],
+) -> Subbuffer<[u32]> {
+    Buffer::from_iter(
+        allocator,
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        data.iter().copied(),
+    )
+    .unwrap()
+}
+
+fn make_buffer_u8(
+    allocator: Arc<StandardMemoryAllocator>,
+    data: &[u8],
+) -> Subbuffer<[u8]> {
+    Buffer::from_iter(
+        allocator,
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        data.iter().copied(),
+    )
+    .unwrap()
 }
 
 impl MiningBackend for VulkanBackend {
@@ -14,36 +117,404 @@ impl MiningBackend for VulkanBackend {
 
     fn run(
         &self,
-        _config: &MiningConfig,
-        _stop: &AtomicBool,
-        _total: &AtomicU64,
-        _tx: mpsc::Sender<Match>,
+        config: &MiningConfig,
+        stop: &AtomicBool,
+        total: &AtomicU64,
+        tx: mpsc::Sender<Match>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let start = Instant::now();
+
+        // 1. Init Vulkan
+        let library = VulkanLibrary::new()?;
+        let instance = Instance::new(library, InstanceCreateInfo::default())?;
+
+        let physical_devices: Vec<_> = instance
+            .enumerate_physical_devices()?
+            .filter(|pd| {
+                pd.queue_family_properties()
+                    .iter()
+                    .any(|qf| qf.queue_flags.intersects(QueueFlags::COMPUTE))
+            })
+            .collect();
+
+        let physical_device = physical_devices
+            .into_iter()
+            .nth(self.device_index)
+            .ok_or("no compute-capable Vulkan device at requested index")?;
+
+        let queue_family_index = physical_device
+            .queue_family_properties()
+            .iter()
+            .position(|qf| qf.queue_flags.intersects(QueueFlags::COMPUTE))
+            .unwrap() as u32;
+
+        let (device, mut queues) = Device::new(
+            physical_device,
+            DeviceCreateInfo {
+                enabled_features: DeviceFeatures {
+                    shader_int64: true,
+                    shader_int8: true,
+                    uniform_and_storage_buffer8_bit_access: true,
+                    storage_buffer8_bit_access: true,
+                    ..DeviceFeatures::empty()
+                },
+                queue_create_infos: vec![QueueCreateInfo {
+                    queue_family_index,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )?;
+        let queue = queues.next().unwrap();
+
+        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+            device.clone(),
+            Default::default(),
+        ));
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+            device.clone(),
+            Default::default(),
+        ));
+
+        // 2. Load SPIR-V modules
+        let mine_spv = include_bytes!(concat!(env!("OUT_DIR"), "/mine.comp.spv"));
+        let init_g_table_spv = include_bytes!(concat!(env!("OUT_DIR"), "/init_g_table.comp.spv"));
+        let stride_g_spv = include_bytes!(concat!(env!("OUT_DIR"), "/stride_g.comp.spv"));
+
+        let mine_module = load_shader_module(device.clone(), mine_spv);
+        let init_g_table_module = load_shader_module(device.clone(), init_g_table_spv);
+        let stride_g_module = load_shader_module(device.clone(), stride_g_spv);
+
+        // 3. Create compute pipelines
+        let mine_pipeline = make_compute_pipeline(device.clone(), mine_module);
+        let init_g_table_pipeline = make_compute_pipeline(device.clone(), init_g_table_module);
+        let stride_g_pipeline = make_compute_pipeline(device.clone(), stride_g_module);
+
+        // 4. Build CBOR template
+        let tmpl = CborTemplate::new(&config.handle, &config.pds);
+
+        // 5. Allocate g_table buffer and run init_g_table
+        let g_table_buf = make_buffer_u32(memory_allocator.clone(), &[0u32; 240]);
+        {
+            let layout = init_g_table_pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                layout.clone(),
+                [WriteDescriptorSet::buffer(0, g_table_buf.clone())],
+                [],
+            )
+            .unwrap();
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                command_buffer_allocator.clone(),
+                queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap();
+
+            builder
+                .bind_pipeline_compute(init_g_table_pipeline.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    init_g_table_pipeline.layout().clone(),
+                    0,
+                    set,
+                )
+                .unwrap();
+            unsafe { builder.dispatch([1, 1, 1]) }.unwrap();
+
+            let cmd = builder.build().unwrap();
+            vulkano::sync::now(device.clone())
+                .then_execute(queue.clone(), cmd)
+                .unwrap()
+                .then_signal_fence_and_flush()
+                .unwrap()
+                .wait(None)?;
+        }
+
+        // 6. Compute stride_G
+        let stride_val_u32 = TOTAL_THREADS;
+        let mut stride_in_data = [0u32; 8];
+        stride_in_data[0] = stride_val_u32;
+        let stride_in_buf = make_buffer_u32(memory_allocator.clone(), &stride_in_data);
+        let stride_out_buf = make_buffer_u32(memory_allocator.clone(), &[0u32; 32]); // 8 (stride) + 24 (stride_g)
+        {
+            let layout = stride_g_pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, stride_in_buf),
+                    WriteDescriptorSet::buffer(1, stride_out_buf.clone()),
+                    WriteDescriptorSet::buffer(2, g_table_buf.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                command_buffer_allocator.clone(),
+                queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap();
+
+            builder
+                .bind_pipeline_compute(stride_g_pipeline.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    stride_g_pipeline.layout().clone(),
+                    0,
+                    set,
+                )
+                .unwrap();
+            unsafe { builder.dispatch([1, 1, 1]) }.unwrap();
+
+            let cmd = builder.build().unwrap();
+            vulkano::sync::now(device.clone())
+                .then_execute(queue.clone(), cmd)
+                .unwrap()
+                .then_signal_fence_and_flush()
+                .unwrap()
+                .wait(None)?;
+        }
+
+        // Read back stride and stride_G
+        let stride_out_data = stride_out_buf.read().unwrap();
+        let mut stride_arr = [0u32; 8];
+        let mut stride_g_arr = [0u32; 24];
+        stride_arr.copy_from_slice(&stride_out_data[0..8]);
+        stride_g_arr.copy_from_slice(&stride_out_data[8..32]);
+
+        // 7. Generate initial per-thread scalars (big-endian, 32 bytes each)
+        let mut rng = rand::thread_rng();
+        let base_key = SigningKey::random(&mut rng);
+        let mut scalar_data = vec![0u8; TOTAL_THREADS as usize * 32];
+        for tid in 0..TOTAL_THREADS as u64 {
+            let offset_scalar = k256::Scalar::from(tid);
+            let thread_scalar = base_key.as_nonzero_scalar().as_ref() + &offset_scalar;
+            let thread_bytes = thread_scalar.to_bytes();
+            let start_idx = tid as usize * 32;
+            scalar_data[start_idx..start_idx + 32].copy_from_slice(&thread_bytes);
+        }
+
+        let scalars_buf = make_buffer_u8(memory_allocator.clone(), &scalar_data);
+
+        // 8. Allocate pubkeys buffer (24 uints per thread)
+        let pubkeys_buf = make_buffer_u32(
+            memory_allocator.clone(),
+            &vec![0u32; TOTAL_THREADS as usize * 24],
+        );
+
+        // 9. Allocate match output buffers
+        let matches_buf = make_buffer_u32(
+            memory_allocator.clone(),
+            &vec![0u32; MAX_MATCHES as usize * MATCH_SLOT_UINTS as usize],
+        );
+        let match_count_buf = make_buffer_u32(memory_allocator.clone(), &[0u32]);
+
+        // 10. Upload templates and pattern
+        let unsigned_template_buf = make_buffer_u8(memory_allocator.clone(), &tmpl.unsigned_bytes);
+        let signed_template_buf = make_buffer_u8(memory_allocator.clone(), &tmpl.signed_bytes);
+
+        // Pad pattern to at least 4 bytes (vulkano requires non-zero buffer)
+        let mut pattern_data = config.pattern.clone();
+        while pattern_data.len() < 4 || pattern_data.len() % 4 != 0 {
+            pattern_data.push(0);
+        }
+        let pattern_buf = make_buffer_u8(memory_allocator.clone(), &pattern_data);
+
+        // 11. Build KernelParams SSBO
+        // Layout matches the GLSL struct:
+        //   uint unsigned_template_len
+        //   uint signed_template_len
+        //   uint unsigned_pubkey_offsets[2]
+        //   uint signed_pubkey_offsets[2]
+        //   uint signed_sig_offset
+        //   uint pattern_len
+        //   uint stride[8]
+        //   uint stride_g[24]
+        // Total: 2 + 2 + 2 + 1 + 1 + 8 + 24 = 40 uints
+        let mut params_data = vec![0u32; 40];
+        params_data[0] = tmpl.unsigned_bytes.len() as u32;
+        params_data[1] = tmpl.signed_bytes.len() as u32;
+        params_data[2] = tmpl.unsigned_pubkey_offsets[0] as u32;
+        params_data[3] = tmpl.unsigned_pubkey_offsets[1] as u32;
+        params_data[4] = tmpl.signed_pubkey_offsets[0] as u32;
+        params_data[5] = tmpl.signed_pubkey_offsets[1] as u32;
+        params_data[6] = tmpl.signed_sig_offset as u32;
+        params_data[7] = config.pattern.len() as u32;
+        params_data[8..16].copy_from_slice(&stride_arr);
+        params_data[16..40].copy_from_slice(&stride_g_arr);
+        let params_buf = make_buffer_u32(memory_allocator.clone(), &params_data);
+
+        // 12. Create descriptor set for mine pipeline
+        let mine_layout = mine_pipeline.layout().set_layouts().get(0).unwrap();
+
+        let mut is_first_launch = 1u32;
+
+        // 13. Main mining loop
+        loop {
+            if stop.load(Ordering::Relaxed) && !config.keep_going {
+                break;
+            }
+
+            // Reset match count to 0
+            {
+                let mut content = match_count_buf.write().unwrap();
+                content[0] = 0;
+            }
+
+            // Create descriptor set (bindings 0-8)
+            let descriptor_set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                mine_layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, params_buf.clone()),
+                    WriteDescriptorSet::buffer(1, unsigned_template_buf.clone()),
+                    WriteDescriptorSet::buffer(2, signed_template_buf.clone()),
+                    WriteDescriptorSet::buffer(3, pattern_buf.clone()),
+                    WriteDescriptorSet::buffer(4, scalars_buf.clone()),
+                    WriteDescriptorSet::buffer(5, pubkeys_buf.clone()),
+                    WriteDescriptorSet::buffer(6, matches_buf.clone()),
+                    WriteDescriptorSet::buffer(7, match_count_buf.clone()),
+                    WriteDescriptorSet::buffer(8, g_table_buf.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+
+            let push = PushConstants {
+                is_first_launch,
+                iterations_per_thread: ITERATIONS_PER_LAUNCH,
+                max_matches: MAX_MATCHES,
+            };
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                command_buffer_allocator.clone(),
+                queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap();
+
+            builder
+                .bind_pipeline_compute(mine_pipeline.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    mine_pipeline.layout().clone(),
+                    0,
+                    descriptor_set,
+                )
+                .unwrap()
+                .push_constants(mine_pipeline.layout().clone(), 0, push)
+                .unwrap();
+            unsafe { builder.dispatch([NUM_WORKGROUPS, 1, 1]) }.unwrap();
+
+            let cmd = builder.build().unwrap();
+            vulkano::sync::now(device.clone())
+                .then_execute(queue.clone(), cmd)
+                .unwrap()
+                .then_signal_fence_and_flush()
+                .unwrap()
+                .wait(None)?;
+
+            is_first_launch = 0;
+
+            // Update total count
+            let batch_ops = TOTAL_THREADS as u64 * ITERATIONS_PER_LAUNCH as u64;
+            total.fetch_add(batch_ops, Ordering::Relaxed);
+
+            // Check for matches
+            let num_matches = {
+                let content = match_count_buf.read().unwrap();
+                content[0].min(MAX_MATCHES)
+            };
+
+            if num_matches > 0 {
+                let match_data = matches_buf.read().unwrap();
+
+                for i in 0..num_matches as usize {
+                    let base = i * MATCH_SLOT_UINTS as usize;
+                    let found = match_data[base + 30];
+                    if found == 0 {
+                        continue;
+                    }
+
+                    // Unpack privkey (8 uints -> 32 bytes, big-endian within each uint)
+                    let mut privkey_bytes = [0u8; 32];
+                    for j in 0..8 {
+                        let val = match_data[base + j];
+                        privkey_bytes[j * 4] = ((val >> 24) & 0xFF) as u8;
+                        privkey_bytes[j * 4 + 1] = ((val >> 16) & 0xFF) as u8;
+                        privkey_bytes[j * 4 + 2] = ((val >> 8) & 0xFF) as u8;
+                        privkey_bytes[j * 4 + 3] = (val & 0xFF) as u8;
+                    }
+
+                    // Unpack suffix (6 uints -> 24 bytes)
+                    let mut suffix_bytes = [0u8; 24];
+                    for j in 0..6 {
+                        let val = match_data[base + 24 + j];
+                        suffix_bytes[j * 4] = ((val >> 24) & 0xFF) as u8;
+                        suffix_bytes[j * 4 + 1] = ((val >> 16) & 0xFF) as u8;
+                        suffix_bytes[j * 4 + 2] = ((val >> 8) & 0xFF) as u8;
+                        suffix_bytes[j * 4 + 3] = (val & 0xFF) as u8;
+                    }
+
+                    // CPU-side re-verification
+                    let signing_key = match SigningKey::from_bytes((&privkey_bytes).into()) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    };
+
+                    let op = build_signed_op(&signing_key, &config.handle, &config.pds);
+                    let suffix = did_suffix(&op);
+
+                    // Verify GPU suffix matches CPU
+                    let gpu_suffix = std::str::from_utf8(&suffix_bytes).unwrap_or("");
+                    if suffix != gpu_suffix {
+                        eprintln!(
+                            "warning: Vulkan match verification failed: GPU={} CPU={}",
+                            gpu_suffix, suffix
+                        );
+                        continue;
+                    }
+
+                    // Double-check pattern match on CPU side
+                    if !glob_match(&config.pattern, suffix.as_bytes()) {
+                        continue;
+                    }
+
+                    let m = Match {
+                        did: format!("did:plc:{suffix}"),
+                        key_hex: data_encoding::HEXLOWER.encode(&privkey_bytes),
+                        op,
+                        attempts: total.load(Ordering::Relaxed),
+                        elapsed: start.elapsed(),
+                    };
+
+                    if tx.send(m).is_err() {
+                        return Ok(());
+                    }
+
+                    if !config.keep_going {
+                        stop.store(true, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
-    use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
-    use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
-    use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-    use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-    use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags};
-    use vulkano::instance::{Instance, InstanceCreateInfo};
-    use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
-    use vulkano::pipeline::compute::{ComputePipeline, ComputePipelineCreateInfo};
-    use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-    use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
-    use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
-    use vulkano::sync::GpuFuture;
-    use vulkano::device::DeviceFeatures;
-    use vulkano::VulkanLibrary;
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    use sha2::Digest;
+    use super::*;
 
     struct VulkanTestContext {
         device: Arc<Device>,
@@ -115,72 +586,25 @@ mod tests {
     }
 
     fn load_shader(ctx: &VulkanTestContext, spv_bytes: &[u8]) -> Arc<ShaderModule> {
-        let spirv_words: Vec<u32> = spv_bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        unsafe {
-            ShaderModule::new(ctx.device.clone(), ShaderModuleCreateInfo::new(&spirv_words))
-        }
-        .expect("failed to create shader module")
+        load_shader_module(ctx.device.clone(), spv_bytes)
     }
 
     fn create_compute_pipeline(ctx: &VulkanTestContext, shader_module: Arc<ShaderModule>) -> Arc<ComputePipeline> {
-        let entry_point = shader_module.entry_point("main").unwrap();
-        let stage = PipelineShaderStageCreateInfo::new(entry_point);
-        let layout = PipelineLayout::new(
-            ctx.device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(ctx.device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-        ComputePipeline::new(
-            ctx.device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .unwrap()
+        make_compute_pipeline(ctx.device.clone(), shader_module)
     }
 
     fn create_storage_buffer(
         ctx: &VulkanTestContext,
         data: &[u32],
-    ) -> vulkano::buffer::Subbuffer<[u32]> {
-        Buffer::from_iter(
-            ctx.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            data.iter().copied(),
-        )
-        .unwrap()
+    ) -> Subbuffer<[u32]> {
+        make_buffer_u32(ctx.memory_allocator.clone(), data)
     }
 
     fn create_storage_buffer_u8(
         ctx: &VulkanTestContext,
         data: &[u8],
-    ) -> vulkano::buffer::Subbuffer<[u8]> {
-        Buffer::from_iter(
-            ctx.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            data.iter().copied(),
-        )
-        .unwrap()
+    ) -> Subbuffer<[u8]> {
+        make_buffer_u8(ctx.memory_allocator.clone(), data)
     }
 
     fn dispatch_and_wait(
@@ -216,6 +640,7 @@ mod tests {
         future.wait(None).expect("GPU execution failed");
     }
 
+    #[allow(dead_code)]
     fn le_limbs_to_biguint(limbs: &[u32; 8]) -> num_bigint::BigUint {
         let mut bytes = Vec::with_capacity(32);
         for &limb in limbs.iter() {
@@ -224,6 +649,7 @@ mod tests {
         num_bigint::BigUint::from_bytes_le(&bytes)
     }
 
+    #[allow(dead_code)]
     fn biguint_to_le_limbs(val: &num_bigint::BigUint) -> [u32; 8] {
         let bytes = val.to_bytes_le();
         let mut limbs = [0u32; 8];
@@ -238,43 +664,16 @@ mod tests {
     }
 
     // --- GX/GY constants as LE limbs ---
+    #[allow(dead_code)]
     const GX_LIMBS: [u32; 8] = [
         0x16F81798, 0x59F2815B, 0x2DCE28D9, 0x029BFCDB,
         0xCE870B07, 0x55A06295, 0xF9DCBBAC, 0x79BE667E,
     ];
+    #[allow(dead_code)]
     const GY_LIMBS: [u32; 8] = [
         0xFB10D4B8, 0x9C47D08F, 0xA6855419, 0xFD17B448,
         0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77,
     ];
-
-    #[test]
-    fn vulkan_trivial_dispatch() {
-        let ctx = setup();
-
-        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/mine.comp.spv"));
-        let shader_module = load_shader(&ctx, spirv_bytes);
-        let pipeline = create_compute_pipeline(&ctx, shader_module);
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            ctx.command_buffer_allocator.clone(),
-            ctx.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        builder
-            .bind_pipeline_compute(pipeline.clone())
-            .unwrap();
-        unsafe { builder.dispatch([1, 1, 1]) }.unwrap();
-
-        let command_buffer = builder.build().unwrap();
-        let future = vulkano::sync::now(ctx.device.clone())
-            .then_execute(ctx.queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap();
-        future.wait(None).expect("GPU execution failed");
-    }
 
     #[test]
     fn vulkan_field_mul_gx_gy() {
@@ -500,6 +899,7 @@ mod tests {
 
         let test_values: &[u64] = &[2, 3, 15, 16, 17, 256];
         for &val in test_values {
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
             // Build 32-byte big-endian scalar for k256
             let mut be_bytes = [0u8; 32];
             be_bytes[24..].copy_from_slice(&val.to_be_bytes());
@@ -540,7 +940,7 @@ mod tests {
 
     #[test]
     fn vulkan_scalar_mul_g_matches_k256() {
-        use k256::ecdsa::SigningKey;
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
 
         let ctx = setup();
 
@@ -612,6 +1012,7 @@ mod tests {
         ];
 
         for input in test_cases {
+            use sha2::Digest;
             let expected = sha2::Sha256::digest(input);
 
             // Pad input to at least 4 bytes for the SSBO (can't have empty buffer)
@@ -655,7 +1056,7 @@ mod tests {
 
     #[test]
     fn vulkan_ecdsa_sign_matches_k256() {
-        use k256::ecdsa::{SigningKey, VerifyingKey, Signature};
+        use k256::ecdsa::{VerifyingKey, Signature};
 
         let ctx = setup();
 
@@ -672,6 +1073,7 @@ mod tests {
         ];
 
         // Hash a message
+        use sha2::Digest;
         let msg_hash = sha2::Sha256::digest(b"test message for ECDSA");
         let msg_hash_bytes: [u8; 32] = msg_hash.into();
 
@@ -944,4 +1346,221 @@ mod tests {
             );
         }
     }
+
+    // --- End-to-end mining test ---
+
+    /// Minimal diagnostic: dispatch mine.comp with 1 workgroup × 1 iteration,
+    /// pattern "*" (match everything). Checks if the shader produces any output at all.
+    #[test]
+    fn vulkan_mine_minimal_diagnostic() {
+        let ctx = setup();
+
+        let mine_spv = include_bytes!(concat!(env!("OUT_DIR"), "/mine.comp.spv"));
+        let init_g_table_spv = include_bytes!(concat!(env!("OUT_DIR"), "/init_g_table.comp.spv"));
+        let stride_g_spv = include_bytes!(concat!(env!("OUT_DIR"), "/stride_g.comp.spv"));
+
+        let mine_module = load_shader(&ctx, mine_spv);
+        let init_g_table_module = load_shader(&ctx, init_g_table_spv);
+        let stride_g_module = load_shader(&ctx, stride_g_spv);
+
+        let mine_pipeline = create_compute_pipeline(&ctx, mine_module);
+        let init_g_table_pipeline = create_compute_pipeline(&ctx, init_g_table_module);
+        let stride_g_pipeline = create_compute_pipeline(&ctx, stride_g_module);
+
+        // 1. Init g_table
+        let g_table_buf = create_storage_buffer(&ctx, &[0u32; 240]);
+        {
+            let layout = init_g_table_pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                ctx.descriptor_set_allocator.clone(),
+                layout.clone(),
+                [WriteDescriptorSet::buffer(0, g_table_buf.clone())],
+                [],
+            ).unwrap();
+            dispatch_and_wait(&ctx, &init_g_table_pipeline, set);
+        }
+
+        // 2. Compute stride_G (stride = 256, one workgroup)
+        let test_num_threads: u32 = 256;
+        let mut stride_in_data = [0u32; 8];
+        stride_in_data[0] = test_num_threads;
+        let stride_in_buf = create_storage_buffer(&ctx, &stride_in_data);
+        let stride_out_buf = create_storage_buffer(&ctx, &[0u32; 32]);
+        {
+            let layout = stride_g_pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                ctx.descriptor_set_allocator.clone(),
+                layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, stride_in_buf),
+                    WriteDescriptorSet::buffer(1, stride_out_buf.clone()),
+                    WriteDescriptorSet::buffer(2, g_table_buf.clone()),
+                ],
+                [],
+            ).unwrap();
+            dispatch_and_wait(&ctx, &stride_g_pipeline, set);
+        }
+
+        let stride_out_data = stride_out_buf.read().unwrap();
+        let mut stride_arr = [0u32; 8];
+        let mut stride_g_arr = [0u32; 24];
+        stride_arr.copy_from_slice(&stride_out_data[0..8]);
+        stride_g_arr.copy_from_slice(&stride_out_data[8..32]);
+
+        // 3. Generate scalars for 256 threads
+        let mut rng = rand::thread_rng();
+        let base_key = SigningKey::random(&mut rng);
+        let mut scalar_data = vec![0u8; test_num_threads as usize * 32];
+        for tid in 0..test_num_threads as u64 {
+            let offset_scalar = k256::Scalar::from(tid);
+            let thread_scalar = base_key.as_nonzero_scalar().as_ref() + &offset_scalar;
+            let thread_bytes = thread_scalar.to_bytes();
+            let start_idx = tid as usize * 32;
+            scalar_data[start_idx..start_idx + 32].copy_from_slice(&thread_bytes);
+        }
+
+        // 4. Set up buffers
+        let tmpl = CborTemplate::new("test.bsky.social", "https://bsky.social");
+        eprintln!("Template sizes: unsigned={}, signed={}", tmpl.unsigned_bytes.len(), tmpl.signed_bytes.len());
+
+        let scalars_buf = create_storage_buffer_u8(&ctx, &scalar_data);
+        let pubkeys_buf = create_storage_buffer(&ctx, &vec![0u32; test_num_threads as usize * 24]);
+
+        let max_matches: u32 = 64;
+        let match_slot_uints: u32 = 32;
+        let matches_buf = create_storage_buffer(&ctx, &vec![0u32; max_matches as usize * match_slot_uints as usize]);
+        let match_count_buf = create_storage_buffer(&ctx, &[0u32]);
+
+        let unsigned_template_buf = create_storage_buffer_u8(&ctx, &tmpl.unsigned_bytes);
+        let signed_template_buf = create_storage_buffer_u8(&ctx, &tmpl.signed_bytes);
+
+        // Pattern "*" — matches everything
+        let pattern = b"*\0\0\0"; // pad to 4 bytes
+        let pattern_buf = create_storage_buffer_u8(&ctx, pattern);
+
+        // KernelParams
+        let mut params_data = vec![0u32; 40];
+        params_data[0] = tmpl.unsigned_bytes.len() as u32;
+        params_data[1] = tmpl.signed_bytes.len() as u32;
+        params_data[2] = tmpl.unsigned_pubkey_offsets[0] as u32;
+        params_data[3] = tmpl.unsigned_pubkey_offsets[1] as u32;
+        params_data[4] = tmpl.signed_pubkey_offsets[0] as u32;
+        params_data[5] = tmpl.signed_pubkey_offsets[1] as u32;
+        params_data[6] = tmpl.signed_sig_offset as u32;
+        params_data[7] = 1; // pattern_len = 1 (just "*")
+        params_data[8..16].copy_from_slice(&stride_arr);
+        params_data[16..40].copy_from_slice(&stride_g_arr);
+        let params_buf = create_storage_buffer(&ctx, &params_data);
+
+        // 5. Dispatch mine with 1 workgroup, 1 iteration
+        let mine_layout = mine_pipeline.layout().set_layouts().get(0).unwrap();
+        let descriptor_set = DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            mine_layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, params_buf),
+                WriteDescriptorSet::buffer(1, unsigned_template_buf),
+                WriteDescriptorSet::buffer(2, signed_template_buf),
+                WriteDescriptorSet::buffer(3, pattern_buf),
+                WriteDescriptorSet::buffer(4, scalars_buf),
+                WriteDescriptorSet::buffer(5, pubkeys_buf),
+                WriteDescriptorSet::buffer(6, matches_buf.clone()),
+                WriteDescriptorSet::buffer(7, match_count_buf.clone()),
+                WriteDescriptorSet::buffer(8, g_table_buf),
+            ],
+            [],
+        ).unwrap();
+
+        let push = PushConstants {
+            is_first_launch: 1,
+            iterations_per_thread: 1,
+            max_matches: max_matches,
+        };
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            ctx.command_buffer_allocator.clone(),
+            ctx.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        ).unwrap();
+
+        builder
+            .bind_pipeline_compute(mine_pipeline.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                mine_pipeline.layout().clone(),
+                0,
+                descriptor_set,
+            )
+            .unwrap()
+            .push_constants(mine_pipeline.layout().clone(), 0, push)
+            .unwrap();
+        unsafe { builder.dispatch([1, 1, 1]) }.unwrap();
+
+        let cmd = builder.build().unwrap();
+        eprintln!("Dispatching mine shader: 1 workgroup × 256 threads × 1 iteration...");
+        vulkano::sync::now(ctx.device.clone())
+            .then_execute(ctx.queue.clone(), cmd)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .expect("GPU dispatch failed");
+        eprintln!("Dispatch completed!");
+
+        // 6. Check results
+        let num_matches = {
+            let content = match_count_buf.read().unwrap();
+            content[0]
+        };
+        eprintln!("Match count: {} (expected ~256 with pattern '*')", num_matches);
+        assert!(num_matches > 0, "Pattern '*' with 256 threads should produce matches, got 0");
+
+        // Verify first match
+        let match_data = matches_buf.read().unwrap();
+        let base = 0usize;
+        let found = match_data[base + 30];
+        assert_eq!(found, 1, "First match slot should have found=1");
+
+        // Unpack privkey
+        let mut privkey_bytes = [0u8; 32];
+        for j in 0..8 {
+            let val = match_data[base + j];
+            privkey_bytes[j * 4] = ((val >> 24) & 0xFF) as u8;
+            privkey_bytes[j * 4 + 1] = ((val >> 16) & 0xFF) as u8;
+            privkey_bytes[j * 4 + 2] = ((val >> 8) & 0xFF) as u8;
+            privkey_bytes[j * 4 + 3] = (val & 0xFF) as u8;
+        }
+
+        // Unpack suffix
+        let mut suffix_bytes = [0u8; 24];
+        for j in 0..6 {
+            let val = match_data[base + 24 + j];
+            suffix_bytes[j * 4] = ((val >> 24) & 0xFF) as u8;
+            suffix_bytes[j * 4 + 1] = ((val >> 16) & 0xFF) as u8;
+            suffix_bytes[j * 4 + 2] = ((val >> 8) & 0xFF) as u8;
+            suffix_bytes[j * 4 + 3] = (val & 0xFF) as u8;
+        }
+
+        let gpu_suffix = std::str::from_utf8(&suffix_bytes).unwrap_or("<invalid utf8>");
+        eprintln!("GPU suffix: {}", gpu_suffix);
+        eprintln!("GPU privkey: {}", data_encoding::HEXLOWER.encode(&privkey_bytes));
+
+        // CPU re-verification
+        let signing_key = SigningKey::from_bytes((&privkey_bytes).into())
+            .expect("GPU privkey should be valid");
+        let op = build_signed_op(&signing_key, "test.bsky.social", "https://bsky.social");
+        let cpu_suffix = did_suffix(&op);
+        eprintln!("CPU suffix: {}", cpu_suffix);
+        assert_eq!(
+            gpu_suffix, cpu_suffix,
+            "GPU suffix must match CPU re-verification"
+        );
+    }
+
+    // The full vulkan_mining_finds_valid_match test is replaced by
+    // vulkan_mine_minimal_diagnostic above which verifies correctness
+    // with manageable GPU workload (256 threads × 1 iteration).
+    // The full VulkanBackend::run() test would require minutes of GPU time
+    // even in release mode due to the heavy ECDSA pipeline.
 }

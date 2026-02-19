@@ -1,5 +1,373 @@
-#version 450
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 256) in;
+
+#include "secp256k1.glsl"
+#include "sha256.glsl"
+#include "hmac_drbg.glsl"
+#include "encoding.glsl"
+#include "pattern.glsl"
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint is_first_launch;
+    uint iterations_per_thread;
+    uint max_matches;
+};
+
+// Set 0, Binding 0: KernelParams
+layout(std430, set = 0, binding = 0) readonly buffer KernelParams {
+    uint unsigned_template_len;
+    uint signed_template_len;
+    uint unsigned_pubkey_offsets[2];
+    uint signed_pubkey_offsets[2];
+    uint signed_sig_offset;
+    uint pattern_len;
+    uint stride[8];        // U256
+    uint stride_g[24];     // JacobianPoint = 3 x U256
+};
+
+// Set 0, Binding 1: unsigned_template
+layout(std430, set = 0, binding = 1) readonly buffer UnsignedTemplate {
+    uint8_t unsigned_template[];
+};
+
+// Set 0, Binding 2: signed_template
+layout(std430, set = 0, binding = 2) readonly buffer SignedTemplate {
+    uint8_t signed_template[];
+};
+
+// Set 0, Binding 3: pattern
+layout(std430, set = 0, binding = 3) readonly buffer Pattern {
+    uint8_t pattern_data[];
+};
+
+// Set 0, Binding 4: scalars — N * 32 bytes (big-endian per thread)
+layout(std430, set = 0, binding = 4) buffer Scalars {
+    uint8_t scalars[];
+};
+
+// Set 0, Binding 5: pubkeys — N * 24 uints (JacobianPoint per thread)
+layout(std430, set = 0, binding = 5) buffer Pubkeys {
+    uint pubkeys[];
+};
+
+// Set 0, Binding 6: matches
+// Per slot: privkey uint8_t[32], signature uint8_t[64], suffix uint8_t[24], found uint
+// = 120 bytes + 4 bytes = 124 bytes, but uint8_t[120] + uint needs alignment
+// Layout: 124 bytes per slot, but we need to handle alignment carefully.
+// Use uint8_t for the byte data and a separate approach for found.
+// Actually, let's lay it out as: 32 u32s (match data as u32s)
+// 32 bytes privkey = 8 uints, 64 bytes sig = 16 uints, 24 bytes suffix = 6 uints, 1 uint found = total 31 uints
+// Pad to 32 uints per slot for alignment.
+layout(std430, set = 0, binding = 6) buffer Matches {
+    uint match_data[];  // 32 uints per match slot
+};
+
+// Set 0, Binding 7: match_count (atomic)
+layout(std430, set = 0, binding = 7) buffer MatchCount {
+    uint match_count;
+};
+
+// Set 0, Binding 8: g_table (15 affine points = 240 uints)
+layout(std430, set = 0, binding = 8) readonly buffer GTable {
+    uint g_table_data[240];
+};
+
+// Helper: load scalar from uint8_t SSBO into U256
+// Scalars are stored big-endian in the SSBO (32 bytes per thread)
+void load_scalar_from_ssbo(inout U256 r, uint offset) {
+    uint bytes32[32];
+    for (int i = 0; i < 32; i++) {
+        bytes32[i] = uint(scalars[offset + i]);
+    }
+    secp_load_scalar(r, bytes32);
+}
+
+// Helper: store U256 to uint8_t SSBO as big-endian
+void store_scalar_to_ssbo(in U256 a, uint offset) {
+    uint bytes32[32];
+    secp_store_scalar(bytes32, a);
+    for (int i = 0; i < 32; i++) {
+        scalars[offset + i] = uint8_t(bytes32[i]);
+    }
+}
+
+// Helper: load JacobianPoint from pubkeys SSBO
+void load_pubkey_from_ssbo(inout JacobianPoint p, uint tid) {
+    uint base = tid * 24u;
+    for (int i = 0; i < 8; i++) {
+        p.x.d[i] = pubkeys[base + i];
+        p.y.d[i] = pubkeys[base + 8u + i];
+        p.z.d[i] = pubkeys[base + 16u + i];
+    }
+}
+
+// Helper: store JacobianPoint to pubkeys SSBO
+void store_pubkey_to_ssbo(in JacobianPoint p, uint tid) {
+    uint base = tid * 24u;
+    for (int i = 0; i < 8; i++) {
+        pubkeys[base + i] = p.x.d[i];
+        pubkeys[base + 8u + i] = p.y.d[i];
+        pubkeys[base + 16u + i] = p.z.d[i];
+    }
+}
+
+// Helper: load g_table from SSBO into local array
+void load_g_table(inout AffinePoint table[15]) {
+    for (int i = 0; i < 15; i++) {
+        for (int j = 0; j < 8; j++) {
+            table[i].x.d[j] = g_table_data[i * 16 + j];
+            table[i].y.d[j] = g_table_data[i * 16 + 8 + j];
+        }
+    }
+}
+
+// Helper: load stride U256 from params
+void load_stride(inout U256 s) {
+    for (int i = 0; i < 8; i++) s.d[i] = stride[i];
+}
+
+// Helper: load stride_G JacobianPoint from params
+void load_stride_g(inout JacobianPoint p) {
+    for (int i = 0; i < 8; i++) {
+        p.x.d[i] = stride_g[i];
+        p.y.d[i] = stride_g[8 + i];
+        p.z.d[i] = stride_g[16 + i];
+    }
+}
+
+// Helper: load pattern from SSBO
+void load_pattern(inout uint8_t pat[24], uint len) {
+    for (uint i = 0u; i < 24u; i++) {
+        if (i < len) {
+            pat[i] = pattern_data[i];
+        } else {
+            pat[i] = uint8_t(0u);
+        }
+    }
+}
+
+// Helper: write a match to the match buffer
+// Match slot layout (32 uints per slot):
+//   [0..7]   = privkey (32 bytes packed as 8 uints, big-endian byte order within each uint)
+//   [8..23]  = signature (64 bytes packed as 16 uints)
+//   [24..29] = suffix (24 bytes packed as 6 uints)
+//   [30]     = found flag
+//   [31]     = padding
+void write_match(uint slot, in uint8_t privkey32[32], in uint8_t sig64[64], in uint8_t suffix24[24]) {
+    uint base = slot * 32u;
+
+    // Pack privkey: 32 bytes -> 8 uints
+    for (int i = 0; i < 8; i++) {
+        uint idx = i * 4;
+        match_data[base + i] = (uint(privkey32[idx]) << 24) |
+                                (uint(privkey32[idx + 1]) << 16) |
+                                (uint(privkey32[idx + 2]) << 8) |
+                                uint(privkey32[idx + 3]);
+    }
+
+    // Pack signature: 64 bytes -> 16 uints
+    for (int i = 0; i < 16; i++) {
+        uint idx = i * 4;
+        match_data[base + 8u + i] = (uint(sig64[idx]) << 24) |
+                                     (uint(sig64[idx + 1]) << 16) |
+                                     (uint(sig64[idx + 2]) << 8) |
+                                     uint(sig64[idx + 3]);
+    }
+
+    // Pack suffix: 24 bytes -> 6 uints
+    for (int i = 0; i < 6; i++) {
+        uint idx = i * 4;
+        match_data[base + 24u + i] = (uint(suffix24[idx]) << 24) |
+                                      (uint(suffix24[idx + 1]) << 16) |
+                                      (uint(suffix24[idx + 2]) << 8) |
+                                      uint(suffix24[idx + 3]);
+    }
+
+    // Found flag
+    match_data[base + 30u] = 1u;
+    match_data[base + 31u] = 0u; // padding
+}
+
 void main() {
-    // stub
+    uint tid = gl_GlobalInvocationID.x;
+
+    // Load g_table from SSBO
+    AffinePoint g_table[15];
+    load_g_table(g_table);
+
+    // Load current scalar
+    U256 scalar;
+    load_scalar_from_ssbo(scalar, tid * 32u);
+
+    // Load or compute current pubkey
+    JacobianPoint pubkey;
+    if (is_first_launch != 0u) {
+        secp_scalar_mul_G(pubkey, scalar, g_table);
+    } else {
+        load_pubkey_from_ssbo(pubkey, tid);
+    }
+
+    // Load stride and stride_G
+    U256 stride_val;
+    load_stride(stride_val);
+    JacobianPoint stride_g_val;
+    load_stride_g(stride_g_val);
+
+    // Load pattern
+    uint8_t pat[24];
+    load_pattern(pat, pattern_len);
+
+    for (uint iter = 0u; iter < iterations_per_thread; iter++) {
+        // 1. Get compressed public key (33 uint values, each one byte)
+        uint compressed_uint[33];
+        secp_get_compressed_pubkey_uint(compressed_uint, pubkey);
+
+        // 2. Prepend multicodec prefix [0xe7, 0x01] + 33 pubkey bytes = 35 bytes
+        uint8_t multicodec[35];
+        multicodec[0] = uint8_t(0xe7u);
+        multicodec[1] = uint8_t(0x01u);
+        for (int i = 0; i < 33; i++) {
+            multicodec[i + 2] = uint8_t(compressed_uint[i]);
+        }
+
+        // 3. Base58 encode -> 48 chars
+        uint8_t base58_pubkey[48];
+        enc_base58_encode_35bytes(multicodec, base58_pubkey);
+
+        // 4. Build unsigned CBOR: copy template and patch pubkey at 2 offsets
+        uint8_t unsigned_buf[SHA256_MAX_INPUT];
+        for (uint i = 0u; i < unsigned_template_len && i < SHA256_MAX_INPUT; i++) {
+            unsigned_buf[i] = unsigned_template[i];
+        }
+        // Zero the rest for sha256_hash
+        for (uint i = unsigned_template_len; i < SHA256_MAX_INPUT; i++) {
+            unsigned_buf[i] = uint8_t(0u);
+        }
+
+        // Patch base58 pubkey at 2 offsets in unsigned template
+        for (int loc = 0; loc < 2; loc++) {
+            uint off = unsigned_pubkey_offsets[loc];
+            for (int j = 0; j < 48; j++) {
+                unsigned_buf[off + j] = base58_pubkey[j];
+            }
+        }
+
+        // 5. SHA256 the unsigned CBOR -> msg_hash
+        uint8_t msg_hash[32];
+        sha256_hash(unsigned_buf, unsigned_template_len, msg_hash);
+
+        // 6. Store scalar as bytes for ECDSA signing
+        uint8_t privkey_bytes[32];
+        hmac_store_scalar_bytes(privkey_bytes, scalar);
+
+        // 7. RFC 6979 nonce
+        U256 nonce_k;
+        hmac_rfc6979_nonce(nonce_k, privkey_bytes, msg_hash);
+
+        // 8. R = nonce * G
+        JacobianPoint R;
+        secp_scalar_mul_G(R, nonce_k, g_table);
+
+        // 9. Convert R to affine, r = R.x mod n
+        U256 rx, ry;
+        secp_jacobian_to_affine(rx, ry, R);
+
+        U256 r_val = rx;
+        if (secp_cmp(r_val, SECP_N) >= 0) {
+            secp_sub256(r_val, r_val, SECP_N);
+        }
+
+        // 10. s = k_inv * (hash + r * privkey) mod n
+        U256 hash_scalar;
+        hmac_load_scalar_bytes(hash_scalar, msg_hash);
+
+        U256 r_times_priv;
+        secp_scalar_mul(r_times_priv, r_val, scalar);
+
+        U256 hash_plus_rpriv;
+        secp_scalar_add(hash_plus_rpriv, hash_scalar, r_times_priv);
+
+        U256 k_inv;
+        secp_scalar_inv(k_inv, nonce_k);
+
+        U256 s_val;
+        secp_scalar_mul(s_val, k_inv, hash_plus_rpriv);
+
+        // Low-s normalization (BIP-62)
+        if (secp_cmp(s_val, SECP_N_HALF) > 0) {
+            secp_sub256(s_val, SECP_N, s_val);
+        }
+
+        // 11. Encode signature as 64 bytes (r || s, big-endian)
+        uint8_t sig_bytes[64];
+        {
+            uint8_t r_bytes[32];
+            uint8_t s_bytes[32];
+            hmac_store_scalar_bytes(r_bytes, r_val);
+            hmac_store_scalar_bytes(s_bytes, s_val);
+            for (int i = 0; i < 32; i++) {
+                sig_bytes[i] = r_bytes[i];
+                sig_bytes[32 + i] = s_bytes[i];
+            }
+        }
+
+        // 12. Base64url encode signature -> 86 chars
+        uint8_t base64_sig[86];
+        enc_base64url_encode_64bytes(sig_bytes, base64_sig);
+
+        // 13. Build signed CBOR: copy template and patch pubkey + signature
+        uint8_t signed_buf[SHA256_MAX_INPUT];
+        for (uint i = 0u; i < signed_template_len && i < SHA256_MAX_INPUT; i++) {
+            signed_buf[i] = signed_template[i];
+        }
+        for (uint i = signed_template_len; i < SHA256_MAX_INPUT; i++) {
+            signed_buf[i] = uint8_t(0u);
+        }
+
+        // Patch pubkey at 2 offsets
+        for (int loc = 0; loc < 2; loc++) {
+            uint off = signed_pubkey_offsets[loc];
+            for (int j = 0; j < 48; j++) {
+                signed_buf[off + j] = base58_pubkey[j];
+            }
+        }
+
+        // Patch signature
+        {
+            uint off = signed_sig_offset;
+            for (int j = 0; j < 86; j++) {
+                signed_buf[off + j] = base64_sig[j];
+            }
+        }
+
+        // 14. SHA256 the signed CBOR -> did_hash
+        uint8_t did_hash[32];
+        sha256_hash(signed_buf, signed_template_len, did_hash);
+
+        // 15. Base32 encode first 15 bytes -> 24-char suffix
+        uint8_t did_prefix[15];
+        for (int i = 0; i < 15; i++) did_prefix[i] = did_hash[i];
+        uint8_t suffix[24];
+        enc_base32_encode_15bytes(did_prefix, suffix);
+
+        // 16. Pattern match
+        if (pattern_glob_match(pat, pattern_len, suffix, 24u)) {
+            uint slot = atomicAdd(match_count, 1u);
+            if (slot < max_matches) {
+                write_match(slot, privkey_bytes, sig_bytes, suffix);
+            }
+        }
+
+        // 17. Advance: scalar += stride, pubkey += stride_G
+        secp_scalar_add(scalar, scalar, stride_val);
+        secp_point_add(pubkey, pubkey, stride_g_val);
+    }
+
+    // Save state for next kernel launch
+    store_scalar_to_ssbo(scalar, tid * 32u);
+    store_pubkey_to_ssbo(pubkey, tid);
 }

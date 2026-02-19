@@ -1066,6 +1066,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bs58",
+ "bytemuck",
  "clap",
  "console",
  "cudarc",

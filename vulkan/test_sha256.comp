@@ -21,9 +21,9 @@ layout(std430, set = 0, binding = 2) buffer OutputHash {
 void main() {
     uint len = buf_len.input_len;
 
-    // Copy input into local array (max 256 bytes)
-    uint8_t data[256];
-    for (uint i = 0u; i < 256u; i++) {
+    // Copy input into local array (max SHA256_MAX_INPUT bytes)
+    uint8_t data[SHA256_MAX_INPUT];
+    for (uint i = 0u; i < SHA256_MAX_INPUT; i++) {
         data[i] = (i < len) ? buf_input.input_data[i] : uint8_t(0u);
     }
 

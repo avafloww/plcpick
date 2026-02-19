@@ -5,6 +5,9 @@
 // Requires: GL_EXT_shader_explicit_arithmetic_types_int8
 //           GL_EXT_shader_explicit_arithmetic_types_int64
 
+// Maximum input size for sha256_hash(). Must match CUDA kernel buffer sizes.
+const uint SHA256_MAX_INPUT = 512u;
+
 const uint SHA256_K[64] = uint[64](
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
     0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
@@ -101,11 +104,10 @@ void sha256_process_block(inout uint h[8], in uint8_t block[128], uint offset) {
     h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }
 
-// Hash an arbitrary-length message (up to ~256 bytes), output 32 bytes
-// data_len is the actual length of meaningful data in the data array
-// The data array must be large enough: at least data_len bytes.
-// We use a fixed 256-byte input array to avoid variable-length issues.
-void sha256_hash(in uint8_t data[256], uint len, inout uint8_t hash_out[32]) {
+// Hash an arbitrary-length message (up to SHA256_MAX_INPUT bytes), output 32 bytes
+// data_len is the actual length of meaningful data in the data array.
+// Fixed-size array to avoid variable-length issues in GLSL.
+void sha256_hash(in uint8_t data[SHA256_MAX_INPUT], uint len, inout uint8_t hash_out[32]) {
     uint h[8];
     sha256_init(h);
 

@@ -68,7 +68,7 @@ fn select_backend(threads: usize) -> Box<dyn MiningBackend> {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         })).is_ok() {
-            return Box::new(mining::wgpu_backend::WgpuBackend { device_index: 0 });
+            return Box::new(mining::wgpu_backend::WgpuBackend);
         }
     }
 
@@ -103,7 +103,7 @@ fn main() {
         #[cfg(feature = "cuda")]
         "cuda" => Box::new(mining::cuda::CudaBackend { device_id: 0 }),
         #[cfg(feature = "wgpu")]
-        "wgpu" => Box::new(mining::wgpu_backend::WgpuBackend { device_index: 0 }),
+        "wgpu" => Box::new(mining::wgpu_backend::WgpuBackend),
         other => {
             let mut available = vec!["auto", "cpu"];
             if cfg!(feature = "cuda") { available.push("cuda"); }

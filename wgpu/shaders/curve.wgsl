@@ -123,6 +123,15 @@ fn jac_add_affine(
     qx: array<u32, 8>,
     qy: array<u32, 8>
 ) -> JacobianPoint {
+    // Handle P = infinity: return Q as Jacobian (qx, qy, 1)
+    if (jac_is_infinity(p)) {
+        var result: JacobianPoint;
+        result.x = qx;
+        result.y = qy;
+        result.z = fe_one();
+        return result;
+    }
+
     // Z1² and Z1³
     let z1z1 = fe_square(p.z);         // Z1²
     let z1z1z1 = fe_mul(z1z1, p.z);    // Z1³
@@ -197,42 +206,9 @@ fn jac_to_affine(p: JacobianPoint) -> AffinePoint {
     return result;
 }
 
-// 4-bit windowed scalar multiplication: scalar * G using precomputed table
-// g_table_x/g_table_y: 15 affine points, each 8 u32 limbs = 120 u32s total per coordinate
-fn scalar_mul_g_windowed(
-    scalar: array<u32, 8>,
-    g_table_x: ptr<storage, array<u32>, read>,
-    g_table_y: ptr<storage, array<u32>, read>
-) -> JacobianPoint {
-    var result = jac_infinity();
-
-    // Process 64 nibbles (256 bits / 4 bits per nibble), high to low
-    for (var i = 63i; i >= 0; i--) {
-        // Double 4 times
-        result = jac_double(result);
-        result = jac_double(result);
-        result = jac_double(result);
-        result = jac_double(result);
-
-        // Extract 4-bit nibble from scalar
-        let limb_idx = u32(i) / 8u;
-        let nibble_idx = u32(i) % 8u;
-        let nibble = (scalar[limb_idx] >> (nibble_idx * 4u)) & 0xFu;
-
-        if (nibble != 0u) {
-            // Look up g_table[nibble - 1]
-            let table_offset = (nibble - 1u) * 8u;
-            var qx: array<u32, 8>;
-            var qy: array<u32, 8>;
-            for (var j = 0u; j < 8u; j++) {
-                qx[j] = (*g_table_x)[table_offset + j];
-                qy[j] = (*g_table_y)[table_offset + j];
-            }
-            result = jac_add_affine(result, qx, qy);
-        }
-    }
-    return result;
-}
+// NOTE: scalar_mul_g_windowed is defined in ec_pass.wgsl where it can
+// directly access the g_table_x/g_table_y storage bindings (WGSL does not
+// allow passing storage pointers as function arguments).
 
 // -----------------------------------------------------------------------------
 // 256-bit scalar addition (for distance tracking)

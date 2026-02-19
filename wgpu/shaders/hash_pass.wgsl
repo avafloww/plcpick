@@ -90,8 +90,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var suffix: array<u32, 24>;
     enc_base32_15bytes(&hash_bytes_15, &suffix);
 
+    // Copy pattern from storage into local array for function call
+    var pat_local: array<u32, 24>;
+    for (var i = 0u; i < params.pattern_len; i++) {
+        pat_local[i] = pattern_buf[i];
+    }
+
     // Pattern match
-    if (pattern_glob_match(&pattern_buf, params.pattern_len, &suffix, 24u)) {
+    if (pattern_glob_match(&pat_local, params.pattern_len, &suffix, 24u)) {
         let slot = atomicAdd(&match_count, 1u);
         if (slot < params.max_matches) {
             let match_offset = slot * MATCH_STRIDE;

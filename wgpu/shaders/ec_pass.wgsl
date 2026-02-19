@@ -27,6 +27,39 @@ struct EcPassParams {
 @group(0) @binding(6) var<storage, read_write> results: array<u32>;
 @group(0) @binding(7) var<uniform> params: EcPassParams;
 
+// 4-bit windowed scalar multiplication: scalar * G using precomputed table
+// Accesses g_table_x/g_table_y bindings directly (WGSL can't pass storage ptrs)
+fn scalar_mul_g_windowed(scalar: array<u32, 8>) -> JacobianPoint {
+    var result = jac_infinity();
+
+    // Process 64 nibbles (256 bits / 4 bits per nibble), high to low
+    for (var i = 63i; i >= 0; i--) {
+        // Double 4 times
+        result = jac_double(result);
+        result = jac_double(result);
+        result = jac_double(result);
+        result = jac_double(result);
+
+        // Extract 4-bit nibble from scalar
+        let limb_idx = u32(i) / 8u;
+        let nibble_idx = u32(i) % 8u;
+        let nibble = (scalar[limb_idx] >> (nibble_idx * 4u)) & 0xFu;
+
+        if (nibble != 0u) {
+            // Look up g_table[nibble - 1]
+            let table_offset = (nibble - 1u) * 8u;
+            var qx: array<u32, 8>;
+            var qy: array<u32, 8>;
+            for (var j = 0u; j < 8u; j++) {
+                qx[j] = g_table_x[table_offset + j];
+                qy[j] = g_table_y[table_offset + j];
+            }
+            result = jac_add_affine(result, qx, qy);
+        }
+    }
+    return result;
+}
+
 // secp256k1 N/2 for low-s normalization (BIP-62)
 const SECP_N_HALF = array<u32, 8>(
     0x681B20A0u, 0xDFE92F46u, 0x57A4501Du, 0x5D576E73u,
@@ -89,12 +122,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 2. Compute public key
     var pubkey: JacobianPoint;
     if (params.is_first_launch != 0u) {
-        pubkey = scalar_mul_g_windowed(scalar, &g_table_x, &g_table_y);
+        pubkey = scalar_mul_g_windowed(scalar);
     } else {
         // Incremental: pubkey += stride_G (load previous pubkey from results as affine, add stride_G)
         // For simplicity, recompute from scalar each time in initial implementation
         // TODO: optimize with incremental point addition
-        pubkey = scalar_mul_g_windowed(scalar, &g_table_x, &g_table_y);
+        pubkey = scalar_mul_g_windowed(scalar);
     }
 
     // 3. Compress pubkey to 33 bytes
@@ -138,7 +171,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let nonce_k = hmac_rfc6979_nonce(scalar, hash_scalar);
 
     // 10. R = nonce * G
-    let R = scalar_mul_g_windowed(nonce_k, &g_table_x, &g_table_y);
+    let R = scalar_mul_g_windowed(nonce_k);
 
     // 11. r = R.x mod n
     let R_aff = jac_to_affine(R);

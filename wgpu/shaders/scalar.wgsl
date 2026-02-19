@@ -585,13 +585,12 @@ fn scalar_mod_n_inv(a: array<u32, 8>) -> array<u32, 8> {
     // (limb 7 nybble 7 already processed above)
 
     // Limb 7: nybbles 6..0 (all 0xF)
+    // Loop runs for j = 6, 5, 4, 3, 2, 1, 0 (7 iterations).
+    // When j=0, 0 < 7 is true so body executes; then j wraps to 0xFFFFFFFF, exits.
     for (var j = 6u; j < 7u; j = j - 1u) {
         result = scalar_mod_n_sqr(scalar_mod_n_sqr(scalar_mod_n_sqr(scalar_mod_n_sqr(result))));
         result = scalar_mod_n_mul(result, tab14); // nybble = F
     }
-    // j underflows at j=0u-1u = 0xFFFFFFFF, but we need to process j=0 too
-    result = scalar_mod_n_sqr(scalar_mod_n_sqr(scalar_mod_n_sqr(scalar_mod_n_sqr(result))));
-    result = scalar_mod_n_mul(result, tab14); // nybble 0 of limb 7 = F
 
     // Limb 6: 0xFFFFFFFF — all nybbles are F
     for (var j = 0u; j < 8u; j = j + 1u) {

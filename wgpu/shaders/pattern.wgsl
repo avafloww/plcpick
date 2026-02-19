@@ -2,10 +2,9 @@
 // Same algorithm as the Rust, CUDA, and Vulkan implementations.
 
 // Match pattern against text. Pattern supports '*' wildcard.
-// Pattern is read from a storage buffer; text is a function-local array.
-// Max pattern/text length: 24.
+// Both pattern and text are function-local arrays (max 24 chars).
 fn pattern_glob_match(
-    pattern: ptr<storage, array<u32>, read>,
+    pattern: ptr<function, array<u32, 24>>,
     pat_len: u32,
     text: ptr<function, array<u32, 24>>,
     text_len: u32,

@@ -46,7 +46,7 @@ struct Cli {
     #[arg(short, long)]
     threads: Option<usize>,
 
-    /// Mining backend to use (auto, cpu, cuda, vulkan)
+    /// Mining backend to use (auto, cpu, cuda, wgpu)
     #[arg(long, default_value = "auto")]
     backend: String,
 }
@@ -60,28 +60,15 @@ fn select_backend(threads: usize) -> Box<dyn MiningBackend> {
         }
     }
 
-    #[cfg(feature = "vulkan")]
+    #[cfg(feature = "wgpu")]
     {
-        use vulkano::VulkanLibrary;
-        use vulkano::instance::{Instance, InstanceCreateInfo};
-        use vulkano::device::QueueFlags;
-
-        if let Ok(library) = VulkanLibrary::new() {
-            if let Ok(instance) = Instance::new(library, InstanceCreateInfo::default()) {
-                let has_compute = instance
-                    .enumerate_physical_devices()
-                    .map(|devs| {
-                        devs.into_iter().any(|pd| {
-                            pd.queue_family_properties()
-                                .iter()
-                                .any(|qf| qf.queue_flags.intersects(QueueFlags::COMPUTE))
-                        })
-                    })
-                    .unwrap_or(false);
-                if has_compute {
-                    return Box::new(mining::vulkan::VulkanBackend { device_index: 0 });
-                }
-            }
+        // wgpu auto-detects Vulkan/Metal/DX12 — just check if any adapter exists
+        let instance = wgpu::Instance::default();
+        if pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })).is_ok() {
+            return Box::new(mining::wgpu_backend::WgpuBackend { device_index: 0 });
         }
     }
 
@@ -115,12 +102,12 @@ fn main() {
         "cpu" => Box::new(mining::cpu::CpuBackend { threads }),
         #[cfg(feature = "cuda")]
         "cuda" => Box::new(mining::cuda::CudaBackend { device_id: 0 }),
-        #[cfg(feature = "vulkan")]
-        "vulkan" => Box::new(mining::vulkan::VulkanBackend { device_index: 0 }),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => Box::new(mining::wgpu_backend::WgpuBackend { device_index: 0 }),
         other => {
             let mut available = vec!["auto", "cpu"];
             if cfg!(feature = "cuda") { available.push("cuda"); }
-            if cfg!(feature = "vulkan") { available.push("vulkan"); }
+            if cfg!(feature = "wgpu") { available.push("wgpu"); }
             eprintln!("error: unknown backend '{other}'. available: {}", available.join(", "));
             std::process::exit(1);
         }

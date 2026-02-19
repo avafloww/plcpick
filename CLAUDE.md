@@ -58,7 +58,7 @@ Each attempt: generate secp256k1 key → build signed PLC operation (CBOR) → S
 - **`src/mining/mod.rs`** — `MiningBackend` trait, `MiningConfig`, `Match` struct
 - **`src/mining/cpu.rs`** — Multi-threaded CPU backend
 - **`src/mining/cuda.rs`** — CUDA backend via cudarc; includes extensive GPU-vs-CPU verification tests
-- **`src/mining/wgpu_backend.rs`** — wgpu backend; two-pass WGSL compute pipeline (ec_pass + hash_pass)
+- **`src/mining/wgpu_backend.rs`** — wgpu backend; unified single-dispatch WGSL compute pipeline (mine_pass)
 
 ### CUDA Kernel (`cuda/`)
 
@@ -71,7 +71,7 @@ Each attempt: generate secp256k1 key → build signed PLC operation (CBOR) → S
 
 ### wgpu Shaders (`wgpu/shaders/`)
 
-Two-pass pipeline composed from modular WGSL files (concatenated at compile time via `include_str!()`):
+Unified single-dispatch pipeline composed from modular WGSL files (concatenated at compile time via `include_str!()`):
 
 - **`field.wgsl`** — u32-native secp256k1 field arithmetic (vendored from kangaroo, `mul32`-based)
 - **`curve.wgsl`** — Jacobian point operations (`jac_add_affine`, `jac_double`, `jac_to_affine`)
@@ -80,8 +80,7 @@ Two-pass pipeline composed from modular WGSL files (concatenated at compile time
 - **`hmac_drbg.wgsl`** — HMAC-SHA256 + RFC 6979 deterministic nonce generation
 - **`encoding.wgsl`** — Base32, base58, base64url encoders
 - **`pattern.wgsl`** — Glob pattern matching
-- **`ec_pass.wgsl`** — Pass 1: `scalar_mul_g_windowed`, pubkey compression, ECDSA signing (heavy EC math)
-- **`hash_pass.wgsl`** — Pass 2: CBOR patching + SHA256 + base32 + pattern match (lightweight)
+- **`mine_pass.wgsl`** — Unified mining kernel: EC math + ECDSA signing + CBOR patching + SHA256 + base32 + pattern match (matches CUDA's single-kernel architecture)
 
 Both GPU backends use an incremental key strategy: each thread starts with `base_key + thread_id`, and between launches advances by `stride = total_threads`. Only the first launch does a full scalar multiplication; subsequent launches do a single point addition (`pubkey += stride_G`).
 
@@ -109,7 +108,11 @@ Backend auto-detection (`--backend auto`, the default) probes CUDA first, then w
 - WGSL compiled to SPIR-V via naga, then loaded as passthrough shaders (`EXPERIMENTAL_PASSTHROUGH_SHADERS`) to bypass wgpu's slow SPIR-V validation
 - NVIDIA driver pipeline cache: first cold compile ~7 minutes, subsequent runs with same SPIR-V ~22ms
 - G table [1*G..15*G] computed on CPU, uploaded as SSBO
-- Two-pass pipeline: ec_pass (142 u32s per thread output) → hash_pass (reads ec_pass output)
+- Unified single-dispatch pipeline: mine_pass (full mining pipeline per thread, 64 iterations per dispatch)
+- GPU-side scalar + pubkey advancement between iterations (no CPU roundtrip)
+- Persistent pubkey state (Jacobian coordinates) between dispatches; only first dispatch does full scalar_mul_g
+- Templates packed into single `all_templates` buffer (unsigned + signed + pattern) with offset-based indexing
+- 9 bindings: scalars(rw), pubkeys(rw), g_table_x(ro), g_table_y(ro), stride_g_xy(ro), all_templates(ro), matches(rw), match_count(rw), params(uniform)
 - Match results read back via staging buffer with `map_async` + polling
 - GPU unit tests in `wgpu_backend.rs`: SHA256, field mul, HMAC-SHA256, scalar mul G, ECDSA signing, scalar mod-n operations
 

@@ -206,7 +206,7 @@ fn jac_to_affine(p: JacobianPoint) -> AffinePoint {
     return result;
 }
 
-// NOTE: scalar_mul_g_windowed is defined in ec_pass.wgsl where it can
+// NOTE: scalar_mul_g_windowed is defined in mine_pass.wgsl where it can
 // directly access the g_table_x/g_table_y storage bindings (WGSL does not
 // allow passing storage pointers as function arguments).
 

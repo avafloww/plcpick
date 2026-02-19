@@ -720,6 +720,57 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_field_sqr_matches_cpu() {
+        let ctx = setup();
+
+        let spirv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/test_field_sqr.comp.spv"));
+        let shader_module = load_shader(&ctx, spirv_bytes);
+        let pipeline = create_compute_pipeline(&ctx, shader_module);
+
+        let p = num_bigint::BigUint::parse_bytes(
+            b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
+        ).unwrap();
+
+        // Test with GX, GY, and a crafted value near p
+        let test_values: &[(&str, [u32; 8])] = &[
+            ("GX", GX_LIMBS),
+            ("GY", GY_LIMBS),
+            ("near_p", [0xFFFFFC2E_u32, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
+                        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]),
+        ];
+
+        for (label, limbs) in test_values {
+            let a_big = le_limbs_to_biguint(limbs);
+            let expected_big = (&a_big * &a_big) % &p;
+            let expected_limbs = biguint_to_le_limbs(&expected_big);
+
+            let input_a = create_storage_buffer(&ctx, limbs);
+            let output = create_storage_buffer(&ctx, &[0u32; 8]);
+
+            let layout = pipeline.layout().set_layouts().get(0).unwrap();
+            let set = DescriptorSet::new(
+                ctx.descriptor_set_allocator.clone(),
+                layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, input_a),
+                    WriteDescriptorSet::buffer(1, output.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+
+            dispatch_and_wait(&ctx, &pipeline, set);
+
+            let result = output.read().unwrap();
+            assert_eq!(
+                &result[..], &expected_limbs[..],
+                "GPU field_sqr({label}) must match reference.\nGPU: {:08x?}\nExpected: {:08x?}",
+                &result[..], expected_limbs
+            );
+        }
+    }
+
+    #[test]
     fn vulkan_scalar_mul_mod_n() {
         let ctx = setup();
 

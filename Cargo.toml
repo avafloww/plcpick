@@ -5,8 +5,8 @@ edition = "2024"
 
 [features]
 cuda = ["dep:cudarc"]
-vulkan = ["dep:vulkano", "dep:shaderc"]
-gpu = ["cuda", "vulkan"]
+wgpu = ["dep:wgpu", "dep:pollster"]
+gpu = ["cuda", "wgpu"]
 
 [dependencies]
 base64 = "0.22"
@@ -25,10 +25,8 @@ sha2 = "0.10"
 signature = "2"
 ureq = "2"
 bytemuck = { version = "1.9", features = ["derive"] }
-vulkano = { version = "0.35", optional = true }
-
-[build-dependencies]
-shaderc = { version = "0.10", optional = true }
+wgpu = { version = "28", optional = true }
+pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 num-bigint = "0.4"

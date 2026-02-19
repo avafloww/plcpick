@@ -46,9 +46,33 @@ struct Cli {
     #[arg(short, long)]
     threads: Option<usize>,
 
-    /// Mining backend to use
-    #[arg(long, default_value = "cpu")]
+    /// Mining backend to use (auto, cpu, cuda, wgpu)
+    #[arg(long, default_value = "auto")]
     backend: String,
+}
+
+/// Auto-detect the best available backend: CUDA > Vulkan > CPU.
+fn select_backend(threads: usize) -> Box<dyn MiningBackend> {
+    #[cfg(feature = "cuda")]
+    {
+        if cudarc::driver::CudaDevice::new(0).is_ok() {
+            return Box::new(mining::cuda::CudaBackend { device_id: 0 });
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        // wgpu auto-detects Vulkan/Metal/DX12 — just check if any adapter exists
+        let instance = wgpu::Instance::default();
+        if pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })).is_ok() {
+            return Box::new(mining::wgpu_backend::WgpuBackend);
+        }
+    }
+
+    Box::new(mining::cpu::CpuBackend { threads })
 }
 
 fn main() {
@@ -74,12 +98,17 @@ fn main() {
 
     // select backend
     let backend: Box<dyn MiningBackend> = match cli.backend.as_str() {
+        "auto" => select_backend(threads),
         "cpu" => Box::new(mining::cpu::CpuBackend { threads }),
         #[cfg(feature = "cuda")]
         "cuda" => Box::new(mining::cuda::CudaBackend { device_id: 0 }),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => Box::new(mining::wgpu_backend::WgpuBackend),
         other => {
-            let backends = if cfg!(feature = "cuda") { "cpu, cuda" } else { "cpu" };
-            eprintln!("error: unknown backend '{other}'. available: {backends}");
+            let mut available = vec!["auto", "cpu"];
+            if cfg!(feature = "cuda") { available.push("cuda"); }
+            if cfg!(feature = "wgpu") { available.push("wgpu"); }
+            eprintln!("error: unknown backend '{other}'. available: {}", available.join(", "));
             std::process::exit(1);
         }
     };

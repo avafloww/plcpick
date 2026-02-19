@@ -1,6 +1,8 @@
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_backend;
 
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc;

@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 cuda = ["dep:cudarc"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:naga"]
+gpu = ["cuda", "wgpu"]
 
 [dependencies]
 base64 = "0.22"
@@ -22,6 +24,10 @@ serde_json = "1"
 sha2 = "0.10"
 signature = "2"
 ureq = "2"
+bytemuck = { version = "1.9", features = ["derive"] }
+wgpu = { version = "28", optional = true, features = ["spirv"] }
+pollster = { version = "0.4", optional = true }
+naga = { version = "28", optional = true, features = ["wgsl-in", "spv-out"] }
 
 [dev-dependencies]
 num-bigint = "0.4"

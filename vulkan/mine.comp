@@ -4,6 +4,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 256) in;
 
+#define USE_SHARED_G_TABLE
 #include "secp256k1.glsl"
 #include "sha256.glsl"
 #include "hmac_drbg.glsl"
@@ -115,14 +116,17 @@ void store_pubkey_to_ssbo(in JacobianPoint p, uint tid) {
     }
 }
 
-// Helper: load g_table from SSBO into local array
-void load_g_table(inout AffinePoint table[15]) {
-    for (int i = 0; i < 15; i++) {
+// Helper: cooperatively load g_table from SSBO into shared memory
+// First 15 threads each load one AffinePoint, then all threads barrier
+void load_g_table_shared() {
+    uint lid = gl_LocalInvocationID.x;
+    if (lid < 15u) {
         for (int j = 0; j < 8; j++) {
-            table[i].x.d[j] = g_table_data[i * 16 + j];
-            table[i].y.d[j] = g_table_data[i * 16 + 8 + j];
+            shared_g_table[lid].x.d[j] = g_table_data[lid * 16u + j];
+            shared_g_table[lid].y.d[j] = g_table_data[lid * 16u + 8u + j];
         }
     }
+    barrier();
 }
 
 // Helper: load stride U256 from params
@@ -136,6 +140,135 @@ void load_stride_g(inout JacobianPoint p) {
         p.x.d[i] = stride_g[i];
         p.y.d[i] = stride_g[8 + i];
         p.z.d[i] = stride_g[16 + i];
+    }
+}
+
+// --- SSBO-streaming SHA256 helpers ---
+// Read a byte from the unsigned template SSBO, overlaying base58_pubkey at 2 offsets
+uint8_t read_unsigned_byte(uint pos, in uint8_t base58_pubkey[48]) {
+    for (int loc = 0; loc < 2; loc++) {
+        uint off = unsigned_pubkey_offsets[loc];
+        if (pos >= off && pos < off + 48u) {
+            return base58_pubkey[pos - off];
+        }
+    }
+    return unsigned_template[pos];
+}
+
+// Read a byte from the signed template SSBO, overlaying base58_pubkey at 2 offsets and base64_sig at 1 offset
+uint8_t read_signed_byte(uint pos, in uint8_t base58_pubkey[48], in uint8_t base64_sig[86]) {
+    for (int loc = 0; loc < 2; loc++) {
+        uint off = signed_pubkey_offsets[loc];
+        if (pos >= off && pos < off + 48u) {
+            return base58_pubkey[pos - off];
+        }
+    }
+    {
+        uint off = signed_sig_offset;
+        if (pos >= off && pos < off + 86u) {
+            return base64_sig[pos - off];
+        }
+    }
+    return signed_template[pos];
+}
+
+// Hash unsigned template directly from SSBO, overlaying base58_pubkey patches
+void hash_unsigned_template(inout uint8_t hash_out[32], in uint8_t base58_pubkey[48]) {
+    uint h[8];
+    sha256_init(h);
+
+    uint len = unsigned_template_len;
+    uint8_t block[128];
+
+    // Process complete 64-byte blocks
+    uint i = 0u;
+    while (i + 64u <= len) {
+        for (uint j = 0u; j < 64u; j++) {
+            block[j] = read_unsigned_byte(i + j, base58_pubkey);
+        }
+        sha256_process_block(h, block, 0u);
+        i += 64u;
+    }
+
+    // Padding phase: remaining bytes + 0x80 + zeros + length
+    uint rem = len - i;
+    for (uint j = 0u; j < 128u; j++) block[j] = uint8_t(0u);
+    for (uint j = 0u; j < rem; j++) {
+        block[j] = read_unsigned_byte(i + j, base58_pubkey);
+    }
+    block[rem] = uint8_t(0x80u);
+
+    uint pad_len = (rem < 56u) ? 64u : 128u;
+
+    uint64_t bit_len = uint64_t(len) * 8ul;
+    block[pad_len - 8u] = uint8_t(uint(bit_len >> 56) & 0xFFu);
+    block[pad_len - 7u] = uint8_t(uint(bit_len >> 48) & 0xFFu);
+    block[pad_len - 6u] = uint8_t(uint(bit_len >> 40) & 0xFFu);
+    block[pad_len - 5u] = uint8_t(uint(bit_len >> 32) & 0xFFu);
+    block[pad_len - 4u] = uint8_t(uint((bit_len >> 24)) & 0xFFu);
+    block[pad_len - 3u] = uint8_t(uint((bit_len >> 16)) & 0xFFu);
+    block[pad_len - 2u] = uint8_t(uint((bit_len >> 8)) & 0xFFu);
+    block[pad_len - 1u] = uint8_t(uint(bit_len) & 0xFFu);
+
+    for (uint j = 0u; j < pad_len; j += 64u) {
+        sha256_process_block(h, block, j);
+    }
+
+    for (int j = 0; j < 8; j++) {
+        hash_out[j * 4]     = uint8_t((h[j] >> 24) & 0xFFu);
+        hash_out[j * 4 + 1] = uint8_t((h[j] >> 16) & 0xFFu);
+        hash_out[j * 4 + 2] = uint8_t((h[j] >> 8) & 0xFFu);
+        hash_out[j * 4 + 3] = uint8_t(h[j] & 0xFFu);
+    }
+}
+
+// Hash signed template directly from SSBO, overlaying base58_pubkey and base64_sig patches
+void hash_signed_template(inout uint8_t hash_out[32], in uint8_t base58_pubkey[48], in uint8_t base64_sig[86]) {
+    uint h[8];
+    sha256_init(h);
+
+    uint len = signed_template_len;
+    uint8_t block[128];
+
+    // Process complete 64-byte blocks
+    uint i = 0u;
+    while (i + 64u <= len) {
+        for (uint j = 0u; j < 64u; j++) {
+            block[j] = read_signed_byte(i + j, base58_pubkey, base64_sig);
+        }
+        sha256_process_block(h, block, 0u);
+        i += 64u;
+    }
+
+    // Padding phase
+    uint rem = len - i;
+    for (uint j = 0u; j < 128u; j++) block[j] = uint8_t(0u);
+    for (uint j = 0u; j < rem; j++) {
+        block[j] = read_signed_byte(i + j, base58_pubkey, base64_sig);
+    }
+    block[rem] = uint8_t(0x80u);
+
+    uint pad_len = (rem < 56u) ? 64u : 128u;
+
+    uint64_t bit_len = uint64_t(len) * 8ul;
+    block[pad_len - 8u] = uint8_t(uint(bit_len >> 56) & 0xFFu);
+    block[pad_len - 7u] = uint8_t(uint(bit_len >> 48) & 0xFFu);
+    block[pad_len - 6u] = uint8_t(uint(bit_len >> 40) & 0xFFu);
+    block[pad_len - 5u] = uint8_t(uint(bit_len >> 32) & 0xFFu);
+    block[pad_len - 4u] = uint8_t(uint((bit_len >> 24)) & 0xFFu);
+    block[pad_len - 3u] = uint8_t(uint((bit_len >> 16)) & 0xFFu);
+    block[pad_len - 2u] = uint8_t(uint((bit_len >> 8)) & 0xFFu);
+    block[pad_len - 1u] = uint8_t(uint(bit_len) & 0xFFu);
+
+    for (uint j = 0u; j < pad_len; j += 64u) {
+        sha256_process_block(h, block, j);
+    }
+
+    for (int j = 0; j < 8; j++) {
+        hash_out[j * 4]     = uint8_t((h[j] >> 24) & 0xFFu);
+        hash_out[j * 4 + 1] = uint8_t((h[j] >> 16) & 0xFFu);
+        hash_out[j * 4 + 2] = uint8_t((h[j] >> 8) & 0xFFu);
+        hash_out[j * 4 + 3] = uint8_t(h[j] & 0xFFu);
     }
 }
 
@@ -195,9 +328,8 @@ void write_match(uint slot, in uint8_t privkey32[32], in uint8_t sig64[64], in u
 void main() {
     uint tid = gl_GlobalInvocationID.x;
 
-    // Load g_table from SSBO
-    AffinePoint g_table[15];
-    load_g_table(g_table);
+    // Cooperatively load g_table into shared memory
+    load_g_table_shared();
 
     // Load current scalar
     U256 scalar;
@@ -206,7 +338,7 @@ void main() {
     // Load or compute current pubkey
     JacobianPoint pubkey;
     if (is_first_launch != 0u) {
-        secp_scalar_mul_G(pubkey, scalar, g_table);
+        secp_scalar_mul_G(pubkey, scalar);
     } else {
         load_pubkey_from_ssbo(pubkey, tid);
     }
@@ -238,27 +370,9 @@ void main() {
         uint8_t base58_pubkey[48];
         enc_base58_encode_35bytes(multicodec, base58_pubkey);
 
-        // 4. Build unsigned CBOR: copy template and patch pubkey at 2 offsets
-        uint8_t unsigned_buf[SHA256_MAX_INPUT];
-        for (uint i = 0u; i < unsigned_template_len && i < SHA256_MAX_INPUT; i++) {
-            unsigned_buf[i] = unsigned_template[i];
-        }
-        // Zero the rest for sha256_hash
-        for (uint i = unsigned_template_len; i < SHA256_MAX_INPUT; i++) {
-            unsigned_buf[i] = uint8_t(0u);
-        }
-
-        // Patch base58 pubkey at 2 offsets in unsigned template
-        for (int loc = 0; loc < 2; loc++) {
-            uint off = unsigned_pubkey_offsets[loc];
-            for (int j = 0; j < 48; j++) {
-                unsigned_buf[off + j] = base58_pubkey[j];
-            }
-        }
-
-        // 5. SHA256 the unsigned CBOR -> msg_hash
+        // 4-5. SHA256 unsigned CBOR directly from SSBO (with pubkey overlay)
         uint8_t msg_hash[32];
-        sha256_hash(unsigned_buf, unsigned_template_len, msg_hash);
+        hash_unsigned_template(msg_hash, base58_pubkey);
 
         // 6. Store scalar as bytes for ECDSA signing
         uint8_t privkey_bytes[32];
@@ -270,7 +384,7 @@ void main() {
 
         // 8. R = nonce * G
         JacobianPoint R;
-        secp_scalar_mul_G(R, nonce_k, g_table);
+        secp_scalar_mul_G(R, nonce_k);
 
         // 9. Convert R to affine, r = R.x mod n
         U256 rx, ry;
@@ -319,34 +433,9 @@ void main() {
         uint8_t base64_sig[86];
         enc_base64url_encode_64bytes(sig_bytes, base64_sig);
 
-        // 13. Build signed CBOR: copy template and patch pubkey + signature
-        uint8_t signed_buf[SHA256_MAX_INPUT];
-        for (uint i = 0u; i < signed_template_len && i < SHA256_MAX_INPUT; i++) {
-            signed_buf[i] = signed_template[i];
-        }
-        for (uint i = signed_template_len; i < SHA256_MAX_INPUT; i++) {
-            signed_buf[i] = uint8_t(0u);
-        }
-
-        // Patch pubkey at 2 offsets
-        for (int loc = 0; loc < 2; loc++) {
-            uint off = signed_pubkey_offsets[loc];
-            for (int j = 0; j < 48; j++) {
-                signed_buf[off + j] = base58_pubkey[j];
-            }
-        }
-
-        // Patch signature
-        {
-            uint off = signed_sig_offset;
-            for (int j = 0; j < 86; j++) {
-                signed_buf[off + j] = base64_sig[j];
-            }
-        }
-
-        // 14. SHA256 the signed CBOR -> did_hash
+        // 13-14. SHA256 signed CBOR directly from SSBO (with pubkey + sig overlay)
         uint8_t did_hash[32];
-        sha256_hash(signed_buf, signed_template_len, did_hash);
+        hash_signed_template(did_hash, base58_pubkey, base64_sig);
 
         // 15. Base32 encode first 15 bytes -> 24-char suffix
         uint8_t did_prefix[15];

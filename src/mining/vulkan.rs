@@ -24,9 +24,7 @@ use crate::pattern::glob_match;
 use crate::plc::{build_signed_op, did_suffix, CborTemplate};
 
 const WORKGROUP_SIZE: u32 = 256;
-const NUM_WORKGROUPS: u32 = 1;
-const TOTAL_THREADS: u32 = WORKGROUP_SIZE * NUM_WORKGROUPS; // 256
-const ITERATIONS_PER_LAUNCH: u32 = 1;
+// NUM_WORKGROUPS and ITERATIONS_PER_LAUNCH are now computed at runtime in run()
 const MAX_MATCHES: u32 = 64;
 const MATCH_SLOT_UINTS: u32 = 32; // 32 uints per match slot
 
@@ -123,6 +121,11 @@ impl MiningBackend for VulkanBackend {
         tx: mpsc::Sender<Match>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
+
+        // Dispatch parameters — kept conservative to avoid GPU driver crashes
+        let num_workgroups: u32 = 1;
+        let total_threads: u32 = WORKGROUP_SIZE * num_workgroups;
+        let iterations_per_launch: u32 = 1;
 
         // 1. Init Vulkan
         let library = VulkanLibrary::new()?;
@@ -235,7 +238,7 @@ impl MiningBackend for VulkanBackend {
         }
 
         // 6. Compute stride_G
-        let stride_val_u32 = TOTAL_THREADS;
+        let stride_val_u32 = total_threads;
         let mut stride_in_data = [0u32; 8];
         stride_in_data[0] = stride_val_u32;
         let stride_in_buf = make_buffer_u32(memory_allocator.clone(), &stride_in_data);
@@ -292,8 +295,8 @@ impl MiningBackend for VulkanBackend {
         // 7. Generate initial per-thread scalars (big-endian, 32 bytes each)
         let mut rng = rand::thread_rng();
         let base_key = SigningKey::random(&mut rng);
-        let mut scalar_data = vec![0u8; TOTAL_THREADS as usize * 32];
-        for tid in 0..TOTAL_THREADS as u64 {
+        let mut scalar_data = vec![0u8; total_threads as usize * 32];
+        for tid in 0..total_threads as u64 {
             let offset_scalar = k256::Scalar::from(tid);
             let thread_scalar = base_key.as_nonzero_scalar().as_ref() + &offset_scalar;
             let thread_bytes = thread_scalar.to_bytes();
@@ -306,7 +309,7 @@ impl MiningBackend for VulkanBackend {
         // 8. Allocate pubkeys buffer (24 uints per thread)
         let pubkeys_buf = make_buffer_u32(
             memory_allocator.clone(),
-            &vec![0u32; TOTAL_THREADS as usize * 24],
+            &vec![0u32; total_threads as usize * 24],
         );
 
         // 9. Allocate match output buffers
@@ -389,7 +392,7 @@ impl MiningBackend for VulkanBackend {
 
             let push = PushConstants {
                 is_first_launch,
-                iterations_per_thread: ITERATIONS_PER_LAUNCH,
+                iterations_per_thread: iterations_per_launch,
                 max_matches: MAX_MATCHES,
             };
 
@@ -412,7 +415,7 @@ impl MiningBackend for VulkanBackend {
                 .unwrap()
                 .push_constants(mine_pipeline.layout().clone(), 0, push)
                 .unwrap();
-            unsafe { builder.dispatch([NUM_WORKGROUPS, 1, 1]) }.unwrap();
+            unsafe { builder.dispatch([num_workgroups, 1, 1]) }.unwrap();
 
             let cmd = builder.build().unwrap();
             vulkano::sync::now(device.clone())
@@ -425,7 +428,7 @@ impl MiningBackend for VulkanBackend {
             is_first_launch = 0;
 
             // Update total count
-            let batch_ops = TOTAL_THREADS as u64 * ITERATIONS_PER_LAUNCH as u64;
+            let batch_ops = total_threads as u64 * iterations_per_launch as u64;
             total.fetch_add(batch_ops, Ordering::Relaxed);
 
             // Check for matches

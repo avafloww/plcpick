@@ -24,9 +24,9 @@ use crate::pattern::glob_match;
 use crate::plc::{build_signed_op, did_suffix, CborTemplate};
 
 const WORKGROUP_SIZE: u32 = 256;
-const NUM_WORKGROUPS: u32 = 4;
-const TOTAL_THREADS: u32 = WORKGROUP_SIZE * NUM_WORKGROUPS;
-const ITERATIONS_PER_LAUNCH: u32 = 16;
+const NUM_WORKGROUPS: u32 = 1;
+const TOTAL_THREADS: u32 = WORKGROUP_SIZE * NUM_WORKGROUPS; // 256
+const ITERATIONS_PER_LAUNCH: u32 = 1;
 const MAX_MATCHES: u32 = 64;
 const MATCH_SLOT_UINTS: u32 = 32; // 32 uints per match slot
 

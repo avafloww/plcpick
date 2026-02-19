@@ -5,24 +5,7 @@
 //
 // Byte arrays use array<u32, N> with one byte value (0-255) per u32 element.
 
-// secp256k1 curve order N in little-endian u32 limbs
-const SECP_N = array<u32, 8>(
-    0xD0364141u, 0xBFD25E8Cu, 0xAF48A03Bu, 0xBAAEDCE6u,
-    0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
-);
-
-fn scalar_is_zero(a: array<u32, 8>) -> bool {
-    return (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) == 0u;
-}
-
-// Compare two 256-bit scalars (little-endian limbs). Returns -1, 0, or 1.
-fn scalar_cmp(a: array<u32, 8>, b: array<u32, 8>) -> i32 {
-    for (var i = 7i; i >= 0i; i--) {
-        if (a[i] < b[i]) { return -1i; }
-        if (a[i] > b[i]) { return 1i; }
-    }
-    return 0i;
-}
+// Depends on scalar.wgsl for: SECP_N, scalar_is_zero, scalar_cmp
 
 // Load 32 big-endian bytes (one byte per u32 element) into little-endian u32 limbs
 fn hmac_load_scalar_bytes(bytes32: ptr<function, array<u32, 32>>) -> array<u32, 8> {

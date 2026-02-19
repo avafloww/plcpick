@@ -26,6 +26,10 @@ struct AffinePoint {
     U256 x, y;
 };
 
+#ifdef USE_SHARED_G_TABLE
+shared AffinePoint shared_g_table[15];
+#endif
+
 // --- Constants ---
 
 // Field prime p
@@ -183,7 +187,75 @@ void secp_field_mul(inout U256 r, in U256 a, in U256 b) {
 }
 
 void secp_field_sqr(inout U256 r, in U256 a) {
-    secp_field_mul(r, a, a);
+    // Optimized squaring: 36 multiplies vs 64 in full mul (44% fewer)
+    // Exploits a[i]*a[j] == a[j]*a[i] symmetry
+    uint64_t t[16];
+    for (int i = 0; i < 16; i++) t[i] = 0ul;
+
+    // 1. Cross terms (28 multiplies): accumulate a[i]*a[j] for i<j
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0ul;
+        for (int j = i + 1; j < 8; j++) {
+            uint64_t prod = uint64_t(a.d[i]) * uint64_t(a.d[j]) + t[i + j] + carry;
+            t[i + j] = prod & 0xFFFFFFFFul;
+            carry = prod >> 32;
+        }
+        t[i + 8] += carry;
+    }
+
+    // 2. Double all cross terms (t = 2 * sum(a[i]*a[j] for i<j))
+    uint64_t dc = 0ul;
+    for (int i = 0; i < 16; i++) {
+        dc += t[i] + t[i];
+        t[i] = dc & 0xFFFFFFFFul;
+        dc >>= 32;
+    }
+
+    // 3. Add diagonal squares (8 multiplies): a[i]^2 into t[2*i]
+    dc = 0ul;
+    for (int i = 0; i < 8; i++) {
+        uint64_t sq = uint64_t(a.d[i]) * uint64_t(a.d[i]);
+        dc += t[2*i] + (sq & 0xFFFFFFFFul);
+        t[2*i] = dc & 0xFFFFFFFFul;
+        dc >>= 32;
+        dc += t[2*i+1] + (sq >> 32);
+        t[2*i+1] = dc & 0xFFFFFFFFul;
+        dc >>= 32;
+    }
+
+    // 4. Reduce mod p using: 2^256 = 2^32 + 977 (mod p)
+    {
+        uint64_t carry = 0ul;
+        for (int i = 0; i < 8; i++) {
+            uint64_t hi = t[i + 8];
+            carry += t[i] + hi * 977ul;
+            t[i] = carry & 0xFFFFFFFFul;
+            carry >>= 32;
+            carry += hi;
+        }
+
+        // carry is at most ~2^33. Fold again.
+        uint64_t c_lo = carry * 977ul;
+        uint64_t c_hi = carry;
+        c_lo += t[0];
+        t[0] = c_lo & 0xFFFFFFFFul;
+        c_lo >>= 32;
+        c_lo += t[1] + c_hi;
+        t[1] = c_lo & 0xFFFFFFFFul;
+        c_lo >>= 32;
+        for (int i = 2; i < 8 && c_lo != 0ul; i++) {
+            c_lo += t[i];
+            t[i] = c_lo & 0xFFFFFFFFul;
+            c_lo >>= 32;
+        }
+    }
+
+    for (int i = 0; i < 8; i++) r.d[i] = uint(t[i]);
+
+    // Final reduction: if r >= p, subtract p
+    if (secp_cmp(r, SECP_P) >= 0) {
+        secp_sub256(r, r, SECP_P);
+    }
 }
 
 // Modular inverse via Fermat's little theorem: a^(-1) = a^(p-2) mod p
@@ -671,6 +743,40 @@ void secp_scalar_mul_G(inout JacobianPoint r, in U256 k, in AffinePoint g_table[
         }
     }
 }
+
+#ifdef USE_SHARED_G_TABLE
+// k * G using windowed method, reading from workgroup shared memory
+void secp_scalar_mul_G(inout JacobianPoint r, in U256 k) {
+    // Initialize result to point at infinity
+    for (int i = 0; i < 8; i++) { r.x.d[i] = 0u; r.y.d[i] = 0u; r.z.d[i] = 0u; }
+
+    // Process 4 bits at a time from MSB
+    for (int i = 63; i >= 0; i--) {
+        // Double 4 times (skip on first iteration)
+        if (i < 63) {
+            secp_point_double(r, r);
+            secp_point_double(r, r);
+            secp_point_double(r, r);
+            secp_point_double(r, r);
+        }
+
+        // Extract 4-bit window
+        int limb_idx = i / 8;
+        int bit_offset = (i % 8) * 4;
+        uint window = (k.d[limb_idx] >> bit_offset) & 0xFu;
+
+        if (window != 0u) {
+            if (secp_point_is_infinity(r)) {
+                r.x = shared_g_table[window - 1u].x;
+                r.y = shared_g_table[window - 1u].y;
+                r.z = secp_u256_from_u32(1u);
+            } else {
+                secp_point_add_affine(r, r, shared_g_table[window - 1u].x, shared_g_table[window - 1u].y);
+            }
+        }
+    }
+}
+#endif
 
 // Get compressed public key as uint array (33 uint values, each holding one byte)
 void secp_get_compressed_pubkey_uint(inout uint out33[33], in JacobianPoint pub_key) {
